@@ -311,6 +311,8 @@ enum vk_device_architecture {
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
+    QUALCOMM_ADRENO,
+    QUALCOMM_ADRENO_MALU,
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -421,6 +423,22 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 return vk_device_architecture::NVIDIA_TURING;
             }
         }
+    } else if(props.vendorID == VK_VENDOR_ID_QUALCOMM) {
+        VK_LOG_DEBUG("ggml_vulkan: [DEBUG] Qualcomm Adreno GPU detected (vendorID=0x5143, device=\""<< props.deviceName << "\")");
+
+        const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
+        bool cooperative_matrix = false;
+        // Detect "pre-turing" based on lack of coopmat support.
+        for (const auto& properties : ext_props) {
+            if (strcmp("VK_KHR_cooperative_matrix", properties.extensionName) == 0) {
+                cooperative_matrix = true;
+            }
+        }
+
+        if (!cooperative_matrix) {
+            return vk_device_architecture::QUALCOMM_ADRENO;
+        }
+        return vk_device_architecture::QUALCOMM_ADRENO_MALU;
     }
     return vk_device_architecture::OTHER;
 }
@@ -3797,6 +3815,35 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         m_align =  64;
         s_align =  32;
 
+        // Adreno specific tuning
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support && device->architecture == QUALCOMM_ADRENO) {
+            // Adreno: 64×64×16 tile, f16 acc only
+            // BK=16 for f16/non-quant, BK=32 for quant (still TK=16, just 2 iters per shmem block)
+            const uint32_t adreno_warp = device->subgroup_size;       // typically 64
+            const uint32_t adreno_tm   = device->coopmat_m;           // 64
+            const uint32_t adreno_tn   = device->coopmat_n;           // 64
+            const uint32_t adreno_tk   = device->coopmat_k;           // 16
+
+            // warptile layout: { BLOCK_SIZE, BM, BN, BK, WM, WN, WMITER, TM, TN, TK, WARP }
+            l_warptile = { adreno_warp, adreno_tm, adreno_tn, 16, adreno_tm, adreno_tn, 1, adreno_tm, adreno_tn, adreno_tk, adreno_warp };
+            m_warptile = { adreno_warp, adreno_tm, adreno_tn, 16, adreno_tm, adreno_tn, 1, adreno_tm, adreno_tn, adreno_tk, adreno_warp };
+            s_warptile = { adreno_warp, adreno_tm, adreno_tn, 16, adreno_tm, adreno_tn, 1, adreno_tm, adreno_tn, adreno_tk, adreno_warp };
+
+            // Quant types: BK=32 fits since TK=16, loop runs twice per shmem block
+            l_warptile_mmq = { adreno_warp, adreno_tm, adreno_tn, 32, adreno_tm, adreno_tn, 1, adreno_tm, adreno_tn, adreno_tk, adreno_warp };
+            m_warptile_mmq = { adreno_warp, adreno_tm, adreno_tn, 32, adreno_tm, adreno_tn, 1, adreno_tm, adreno_tn, adreno_tk, adreno_warp };
+            s_warptile_mmq = { adreno_warp, adreno_tm, adreno_tn, 32, adreno_tm, adreno_tn, 1, adreno_tm, adreno_tn, adreno_tk, adreno_warp };
+
+            // (mmq_k, mmqid, etc. can mirror mmq for now)
+            l_mmq_wg_denoms = l_wg_denoms = { adreno_tm, adreno_tn, 1 };
+            m_mmq_wg_denoms = m_wg_denoms = { adreno_tm, adreno_tn, 1 };
+            s_mmq_wg_denoms = s_wg_denoms = { adreno_tm, adreno_tn, 1 };
+
+            l_align = adreno_tm;   // 64
+            m_align = adreno_tm;   // 64
+            s_align = adreno_tm;   // 64
+        }              
+
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
             // Disable medium and large matrix multiplication if not enough shared memory is available
@@ -6192,7 +6239,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #endif
             }
 
-            if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
+            // Adreno supports only f16 acc, but not f32 acc. Disable coopmat if no suitable mode is found.
+            if (device->coopmat_m == 0 || (!device->coopmat_acc_f32_support && !device->coopmat_acc_f16_support)) {
                 // No suitable matmul mode found
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
@@ -6257,6 +6305,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->mul_mat_id_m[i] = true;
                 device->mul_mat_id_s[i] = false;
                 break;
+            case VK_VENDOR_ID_QUALCOMM:
+                device->mul_mat_l[i] = false;
+                device->mul_mat_m[i] = true;
+                device->mul_mat_s[i] = false;
+                device->mul_mat_id_l[i] = false;
+                device->mul_mat_id_m[i] = true;
+                device->mul_mat_id_s[i] = false;
+                break;                
 #endif
             default:
                 device->mul_mat_l[i] = true;
@@ -6919,7 +6975,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) {
         return ctx->device->pipeline_matmul_bf16;
     }
-    if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
+    const bool use_f16acc = ctx->device->fp16 &&
+                        !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support) &&
+                        (prec == GGML_PREC_DEFAULT ||
+                        (ctx->device->coopmat_support && !ctx->device->coopmat_acc_f32_support));
+    if (use_f16acc) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
             return ctx->device->pipeline_matmul_f16_f32.f16acc;
         }
@@ -6983,8 +7043,13 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+        // Fall back to f16acc when f32acc pipelines were not created (e.g. Adreno f16-acc-only).
+        const bool use_f16acc = ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && ctx->device->architecture == QUALCOMM_ADRENO &&
+                                        (prec == GGML_PREC_DEFAULT || !ctx->device->coopmat_acc_f32_support);
+        return use_f16acc ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc
+                                : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
+
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
 
