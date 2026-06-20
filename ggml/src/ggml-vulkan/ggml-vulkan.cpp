@@ -17675,6 +17675,10 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
             return arch == vk_device_architecture::AMD_RDNA3;
         }
         return true;
+    case VK_VENDOR_ID_QUALCOMM: // QUALCOMM Specific
+        // Adreno drivers Kaana/Glymur and up supports coopmat properly
+        // Need to filter out tiers that don't
+        return true;        
     default:
         return true;
     }
