@@ -831,6 +831,9 @@ void process_shaders() {
 
     string_to_spv("sub_f32", "sub.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
+    // QUALCOMM: Qcom specific shader
+    string_to_spv("mul_f32_f32_f32_qcom", "mul_f32_f32_f32_qcom.comp", { {"PLACEHOLDER","NONE"}});    
+
     string_to_spv("acc_f32", "acc.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});

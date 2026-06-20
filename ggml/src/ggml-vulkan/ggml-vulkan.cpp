@@ -5006,6 +5006,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    // QUALCOMM Specific shader, different output layout to feed mul_mm.comp
+    ggml_vk_create_pipeline(device, device->pipeline_mul_f32_f32_f32_qcom,"mul_f32_f32_f32_qcom", mul_f32_f32_f32_qcom_len, mul_f32_f32_f32_qcom_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
@@ -6191,6 +6194,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 }
 #endif
             }
+
+            // Hack for QUALCOMM Adreno since we don't support fp32 accum with fp16 inputs. Let see what happen next
+            device->coopmat_acc_f32_support = true;  // QUALCOMM hack
 
             if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
                 // No suitable matmul mode found
@@ -10339,8 +10345,29 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         case GGML_OP_MUL:
         {
-            auto pipelines = ggml_are_same_shape(src0, src1) ? ctx->device->pipeline_mul_norepeat : ctx->device->pipeline_mul;
-            return pipelines[src0->type == GGML_TYPE_F16][src1->type == GGML_TYPE_F16][dst->type == GGML_TYPE_F16];
+            // layers with output to mat_mm (QUALCOMM CoopMat) that will should have different layout
+            // Different layout will avoid cache issues and increase the QCOM MxM performance
+            char* attn_norm = "attn_norm-0"; // Try this first, if it works enable all attn/ffn RMS_NORM layers
+            //char* attn_norm = "attn_norm-";
+            //char* ffn_norm = "ffn_norm-";
+            //char* ffn_gate_par = "ffn_gate_par-";
+            //char* kqv_merged_cont = "kqv_merged_cont-";
+            if ((strstr(dst->name, attn_norm) != NULL
+                //|| strstr(tensor->name, ffn_norm) != NULL
+                //|| strstr(tensor->name, ffn_gate_par) != NULL
+                //|| strstr(tensor->name, kqv_merged_cont) != NULL
+                ) && dst->ne[1] > 1)
+            {
+#ifdef GGML_VULKAN_SHADER_DEBUG_INFO
+                std::cerr << "ggml_vk_op_get_pipeline: op==GGML_OP_MUL and dst->name==attn_norm-0 dertected, using QCOM shader with pipeline_mul_f32_f32_f32_qcom\n";
+#endif
+                return ctx->device->pipeline_mul_f32_f32_f32_qcom;
+            }
+            else
+            {
+                auto pipelines = ggml_are_same_shape(src0, src1) ? ctx->device->pipeline_mul_norepeat : ctx->device->pipeline_mul;
+                return pipelines[src0->type == GGML_TYPE_F16][src1->type == GGML_TYPE_F16][dst->type == GGML_TYPE_F16];
+            }
         }
         case GGML_OP_DIV:
         {
@@ -17610,6 +17637,11 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
             return arch == vk_device_architecture::AMD_RDNA3;
         }
         return true;
+
+    case VK_VENDOR_ID_QUALCOMM: // QUALCOMM Specific
+        // Adreno drivers Kaana/Glymur and up supports coopmat properly
+        // Need to filter out tiers that don't
+        return true;        
     default:
         return true;
     }
