@@ -949,6 +949,11 @@ struct vk_device_struct {
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
+    #ifdef GGML_VULKAN_ADRENO_KERNELS
+        // Qualcomm Adreno-specific pipelines, keyed by shader name. Only populated on Adreno devices
+        std::unordered_map<std::string, vk_pipeline> pipeline_qcom;
+    #endif
+
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
 
@@ -10404,6 +10409,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         case GGML_OP_MUL:
         {
+        #ifdef GGML_VULKAN_ADRENO_KERNELS
+            // Fetch the pipeline from the Adreno-specific pipeline table if available. Return if pipeline found, otherwise continue to the default pipeline selection.
+        #endif
             auto pipelines = ggml_are_same_shape(src0, src1) ? ctx->device->pipeline_mul_norepeat : ctx->device->pipeline_mul;
             return pipelines[src0->type == GGML_TYPE_F16][src1->type == GGML_TYPE_F16][dst->type == GGML_TYPE_F16];
         }

@@ -615,6 +615,15 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
     }
 }
 
+
+#ifdef GGML_VULKAN_ADRENO_KERNELS
+// Qualcomm Adreno-specific shader variants. Only generated when GGML_VULKAN_ADRENO_KERNELS is enabled. Add new Adreno shaders here;
+    void process_shaders_qcom() {
+        string_to_spv("mul_f32_f32_f32_qcom", "mul_f32_f32_f32_qcom.comp",
+                    {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    }
+#endif
+
 void process_shaders() {
     // matmul
     for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT, MatMulIdType::SUBGROUP}) {
@@ -1078,6 +1087,10 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+
+    #ifdef GGML_VULKAN_ADRENO_KERNELS
+        process_shaders_qcom();
+    #endif
 
     for (auto &c : compiles) {
         c.wait();
