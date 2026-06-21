@@ -1,0 +1,66 @@
+name: CI (adreno)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/build-and-test-adreno.yml'
+      - 'ggml/src/ggml-vulkan/**'
+      - 'ggml/include/ggml-vulkan.h'
+      - 'scripts/snapdragon/adreno/**'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/build-and-test-adreno.yml'
+      - 'ggml/src/ggml-vulkan/**'
+      - 'ggml/include/ggml-vulkan.h'
+      - 'scripts/snapdragon/adreno/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GGML_VK_VISIBLE_DEVICES: 0
+
+jobs:
+  # Android phone with an Adreno GPU attached over USB to the runner host (adb).
+  adreno-android:
+    runs-on: [self-hosted, Adreno, Android]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Build (Android arm64, Vulkan)
+        run: |
+          scripts/snapdragon/adreno/build-adreno.sh \
+            --target android \
+            --backend vulkan \
+            --ndk "$ANDROID_NDK_ROOT"
+
+      - name: Deploy + test-backend-ops (Vulkan0, coopmat on)
+        run: |
+          scripts/snapdragon/adreno/run-android.sh \
+            ${ADRENO_ADB_SERIAL:+--device "$ADRENO_ADB_SERIAL"} \
+            --dst adreno-ci \
+            --bin test-backend-ops \
+            --env GGML_VK_VISIBLE_DEVICES=0 \
+            -- -b Vulkan0 -o MUL_MAT
+
+      - name: test-backend-ops (Vulkan0, coopmat off / scalar fallback)
+        run: |
+          scripts/snapdragon/adreno/run-android.sh \
+            ${ADRENO_ADB_SERIAL:+--device "$ADRENO_ADB_SERIAL"} \
+            --dst adreno-ci \
+            --bin test-backend-ops \
+            --no-push \
+            --env GGML_VK_VISIBLE_DEVICES=0 \
+            --env GGML_VK_DISABLE_COOPMAT=1 \
+            -- -b Vulkan0 -o MUL_MAT

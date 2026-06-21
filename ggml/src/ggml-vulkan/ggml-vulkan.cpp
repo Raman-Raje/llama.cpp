@@ -3816,7 +3816,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         s_align =  32;
 
         // Adreno specific tuning
-        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support && device->architecture == QUALCOMM_ADRENO) {
+        if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support && device->architecture == QUALCOMM_ADRENO_MALU) {
             // Adreno: 64×64×16 tile, f16 acc only
             // BK=16 for f16/non-quant, BK=32 for quant (still TK=16, just 2 iters per shmem block)
             const uint32_t adreno_warp = device->subgroup_size;       // typically 64
@@ -7044,7 +7044,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     }
     if (ctx->device->coopmat_support) {
         // Fall back to f16acc when f32acc pipelines were not created (e.g. Adreno f16-acc-only).
-        const bool use_f16acc = ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && ctx->device->architecture == QUALCOMM_ADRENO &&
+        const bool use_f16acc = ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && ctx->device->architecture == QUALCOMM_ADRENO_MALU &&
                                         (prec == GGML_PREC_DEFAULT || !ctx->device->coopmat_acc_f32_support);
         return use_f16acc ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc
                                 : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
@@ -17676,9 +17676,8 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
         }
         return true;
     case VK_VENDOR_ID_QUALCOMM: // QUALCOMM Specific
-        // Adreno drivers Kaana/Glymur and up supports coopmat properly
-        // Need to filter out tiers that don't
-        return true;        
+        // TODO: Need to filter out tiers that don't support cooperative matrix when we have more Qualcomm GPU architectures
+        return arch == vk_device_architecture::QUALCOMM_ADRENO_MALU;
     default:
         return true;
     }
