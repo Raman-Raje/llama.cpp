@@ -5,7 +5,7 @@
 # Options:
 #   --target   android|win        (default: android)
 #   --backend  vulkan|opencl      (default: vulkan)
-#   --ndk      <path>             Android NDK root
+#   --ndk      <path>             Android NDK root (default: $ANDROID_NDK_HOME / $ANDROID_NDK_ROOT / $ANDROID_NDK)
 #   --root     <path>             llama.cpp root   (default: auto-detected)
 #   --prefix   <path>             Install into <path> (bin/ + lib/) after build
 #   --debug                       Enable debug build / Vulkan debug layer
@@ -23,7 +23,8 @@ DEFAULT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 TARGET="android"
 BACKEND="vulkan"
-NDK_PATH=""
+# Fall back to the standard Android NDK env vars when --ndk is not given
+NDK_PATH="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
 LLAMA_ROOT="$DEFAULT_ROOT"
 PREFIX=""
 DEBUG=0
@@ -69,7 +70,7 @@ fi
 
 # Android builds require the NDK path
 if [ "$TARGET" = "android" ] && [ -z "$NDK_PATH" ]; then
-  echo "Error: --ndk <path> is required for android builds (Android NDK root)"
+  echo "Error: Android NDK root not found. Pass --ndk <path> or set ANDROID_NDK_HOME/ANDROID_NDK_ROOT/ANDROID_NDK"
   exit 1
 fi
 
