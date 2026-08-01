@@ -312,6 +312,8 @@ enum vk_device_architecture {
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
+    QUALCOMM_ADRENO,
+    QUALCOMM_ADRENO_MALU, // [Qcom specific] - Snapdragon Matrix ALUs. First appearing in details for the Snapdragon 8 Elite Gen 6 Pro (SM8975), Adreno 850 GPU
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -430,6 +432,21 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 return vk_device_architecture::NVIDIA_TURING;
             }
         }
+    } else if (props.vendorID == VK_VENDOR_ID_QUALCOMM) {
+        // Snapdragon Matrix ALUs ship starting with the Adreno 850
+        // (Snapdragon 8 Elite Gen 6 Pro, SM8975). The proprietary driver names
+        // devices "Adreno (TM) <model>", turnip uses "Turnip Adreno (TM) <model>".
+        const char * adreno = strstr(props.deviceName.data(), "Adreno");
+        if (adreno != nullptr) {
+            adreno += strlen("Adreno");
+            while (*adreno != '\0' && (*adreno < '0' || *adreno > '9')) {
+                adreno++;
+            }
+            if (atoi(adreno) >= 850) {
+                return vk_device_architecture::QUALCOMM_ADRENO_MALU;
+            }
+        }
+        return vk_device_architecture::QUALCOMM_ADRENO;
     }
     return vk_device_architecture::OTHER;
 }
@@ -766,6 +783,9 @@ struct vk_device_struct {
     bool mul_mat_id_m_int[GGML_TYPE_COUNT];
     bool mul_mat_id_s_int[GGML_TYPE_COUNT];
 
+    // [Qcom-specific] - output tensors feeding coopmat use TileK-First layout
+    bool coopmat_tile_k_first_layout {};
+
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
@@ -963,6 +983,13 @@ struct vk_device_struct {
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
+
+    // [Qcom-specific] elementwise producers writing TileK-first output and the
+    // q4_0 coopmat matmul consuming TileK-first B
+    vk_pipeline pipeline_rms_norm_mul_f32_tilekfirst;
+    vk_pipeline pipeline_mul_f32_f32_f32_tilekfirst;
+    vk_pipeline pipeline_swiglu_f32_tilekfirst;
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q4_0_btilek;
 
     std::vector<vk_pipeline_ref> all_pipelines;
 
@@ -3972,6 +3999,31 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         m_align =  64;
         s_align =  32;
 
+        if (device->architecture == vk_device_architecture::QUALCOMM_ADRENO_MALU && device->coopmat_support) {
+            // Adreno MALU: single subgroup per workgroup on the native
+            // 64x64x16 f16acc shape. BK=16 for float A, BK=32 for quants
+            // (TK stays 16, two iterations per shmem block).
+            const uint32_t malu_warp = device->subgroup_size;
+            const uint32_t malu_tm   = device->coopmat_m;  // 64
+            const uint32_t malu_tn   = device->coopmat_n;  // 64
+            const uint32_t malu_tk   = device->coopmat_k;  // 16
+
+            l_warptile = m_warptile = s_warptile =
+            l_warptile_id = m_warptile_id = s_warptile_id =
+                { malu_warp, malu_tm, malu_tn, 16, malu_tm, malu_tn, 1, malu_tm, malu_tn, malu_tk, malu_warp };
+            l_warptile_mmq = m_warptile_mmq = s_warptile_mmq =
+            l_warptile_mmqid = m_warptile_mmqid = s_warptile_mmqid =
+                { malu_warp, malu_tm, malu_tn, 32, malu_tm, malu_tn, 1, malu_tm, malu_tn, malu_tk, malu_warp };
+
+            l_mmq_wg_denoms = l_wg_denoms = { malu_tm, malu_tn, 1 };
+            m_mmq_wg_denoms = m_wg_denoms = { malu_tm, malu_tn, 1 };
+            s_mmq_wg_denoms = s_wg_denoms = { malu_tm, malu_tn, 1 };
+
+            l_align = malu_tm;
+            m_align = malu_tm;
+            s_align = malu_tm;
+        }
+
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
             // Disable medium and large matrix multiplication if not enough shared memory is available
@@ -4386,6 +4438,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->coopmat_acc_f16_support) {
             CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+            if (device->coopmat_tile_k_first_layout) {
+                CREATE_MM(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q4_0_btilek.f16acc, matmul_q4_0_f32_btilek, _f16acc, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+            }
             CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0], matmul_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_1], matmul_q5_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -5017,6 +5072,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_MXFP4],   "dequant_mxfp4",   dequant_mxfp4_len,   dequant_mxfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_NVFP4],   "dequant_nvfp4",   dequant_nvfp4_len,   dequant_nvfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
 
+    if (device->coopmat_tile_k_first_layout) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32_tilekfirst, "rms_norm_mul_f32_qcom", rms_norm_mul_f32_qcom_len, rms_norm_mul_f32_qcom_data, "main", 4, sizeof(vk_op_binary_push_constants), { 1, 1, 1 }, { 0, 1 }, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_mul_f32_f32_f32_tilekfirst, "mul_f32_f32_f32_qcom", mul_f32_f32_f32_qcom_len, mul_f32_f32_f32_qcom_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0}, 1);
+    }
+
+
     // get_rows
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F16 ], "get_rows_f16",  get_rows_f16_len,  get_rows_f16_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -5283,6 +5344,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(geglu)
     CREATE_GLU(reglu)
     CREATE_GLU(swiglu)
+    // QUALCOMM specific: same shader as swiglu_f32, but includes different (tileK_first) output layout
+    if (device->coopmat_tile_k_first_layout) {
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_f32_tilekfirst, "swiglu_f32_qcom", swiglu_f32_qcom_len, swiglu_f32_qcom_data, "main", 3, sizeof(vk_op_glu_push_constants), { 512, 1, 1 }, {}, 1, true);
+    }
     CREATE_GLU(swiglu_oai)
     CREATE_GLU(geglu_erf)
     CREATE_GLU(geglu_quick)
@@ -6437,7 +6502,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #endif
             }
 
-            if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
+            // Some devices (e.g. Adreno MALU) only support f16 accumulators
+            if (device->coopmat_m == 0 || (!device->coopmat_acc_f32_support && !device->coopmat_acc_f16_support)) {
                 // No suitable matmul mode found
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
@@ -6450,6 +6516,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (device->coopmat_support) {
             device_extensions.push_back("VK_KHR_cooperative_matrix");
         }
+
+        // Activations feeding coopmat matmuls are stored TileK-first on Adreno
+        // Matrix ALUs. Requires the f16acc shape reported above.
+        device->coopmat_tile_k_first_layout = device->coopmat_support &&
+            device->architecture == vk_device_architecture::QUALCOMM_ADRENO_MALU &&
+            device->coopmat_acc_f16_support &&
+            getenv("GGML_VK_DISABLE_TILEK_LAYOUT") == nullptr;
 #if defined(VK_KHR_shader_bfloat16)
         if (device->coopmat_bf16_support) {
             device_extensions.push_back("VK_KHR_shader_bfloat16");
@@ -7171,7 +7244,12 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (src0_type == GGML_TYPE_BF16 && src1_type == GGML_TYPE_BF16) {
         return ctx->device->pipeline_matmul_bf16;
     }
-    if (prec == GGML_PREC_DEFAULT && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
+    // Devices without f32acc coopmat (e.g. Adreno MALU) fall back to f16acc
+    // regardless of the requested precision, as no f32acc pipelines exist.
+    const bool coopmat_f16acc_only = ctx->device->coopmat_support &&
+                                     !ctx->device->coopmat_acc_f32_support &&
+                                     ctx->device->coopmat_acc_f16_support;
+    if ((prec == GGML_PREC_DEFAULT || coopmat_f16acc_only) && ctx->device->fp16 && !(ctx->device->coopmat_support && !ctx->device->coopmat_acc_f16_support)) {
         if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
             return ctx->device->pipeline_matmul_f16_f32.f16acc;
         }
@@ -7235,7 +7313,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
-        return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+        const bool use_f16acc = ctx->device->fp16 && ctx->device->coopmat_acc_f16_support &&
+                                (prec == GGML_PREC_DEFAULT || coopmat_f16acc_only);
+        return use_f16acc ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
 }
@@ -18044,6 +18124,12 @@ static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDevicePrope
             return arch == vk_device_architecture::AMD_RDNA3;
         }
         return true;
+    case VK_VENDOR_ID_QUALCOMM:
+        // Matrix cores only on MALU-class Adreno (>= 850). Older parts may
+        // expose VK_KHR_cooperative_matrix but regress vs the scalar path.
+        // Proprietary drivers from Kaana/Glymur on implement coopmat properly.
+        return arch == vk_device_architecture::QUALCOMM_ADRENO_MALU &&
+               driver_props.driverID == vk::DriverId::eQualcommProprietary;
     default:
         return true;
     }

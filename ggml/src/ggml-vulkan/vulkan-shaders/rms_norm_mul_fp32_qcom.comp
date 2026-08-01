@@ -1,0 +1,222 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#extension GL_EXT_control_flow_attributes : enable
+
+uint fastmod(uint a, uint b) {
+    if ((b & (b - 1)) == 0) {
+        return a & (b - 1);
+    }
+    return a % b;
+}
+
+uint fastdiv(uint a, uint b) {
+    return (a < b) ? 0 : (a / b);
+}
+
+void get_indices(uint idx, out uint i00, out uint i01, out uint i02, out uint i03, uint ne00, uint ne01, uint ne02, uint ne03) {
+    i03 = fastdiv(idx, (ne02 * ne01 * ne00));
+    const uint i03_offset = i03 * ne02 * ne01 * ne00;
+    i02 = fastdiv((idx - i03_offset), (ne01 * ne00));
+    const uint i02_offset = i02 * ne01 * ne00;
+    i01 = (idx - i03_offset - i02_offset) / ne00;
+    i00 = idx - i03_offset - i02_offset - i01 * ne00;
+}
+
+layout(push_constant) uniform parameter
+{
+    uint ne;
+    uint ne00;
+    uint ne01;
+    uint ne02;
+    uint ne03;
+    uint nb00;
+    uint nb01;
+    uint nb02;
+    uint nb03;
+    uint ne10;
+    uint ne11;
+    uint ne12;
+    uint ne13;
+    uint nb10;
+    uint nb11;
+    uint nb12;
+    uint nb13;
+    uint ne20;
+    uint ne21;
+    uint ne22;
+    uint ne23;
+    uint nb20;
+    uint nb21;
+    uint nb22;
+    uint nb23;
+    uint misalign_offsets;
+    float param1;
+    float param2;
+    int param3;
+} p;
+
+
+/*
+ggml_vk_build_graph(src0->name: Vulkan0#embd#0, src1->name: NULL, src2->name: NULL, node->name: norm-0, node->opt: RMS_NORM)
+ggml_vk_op_f32(( name=Vulkan0#embd#0, type=0, ne0=4096, ne1=128, ne2=1, ne3=1, nb0=4, nb1=16384, nb2=2097152, nb3=2097152), ( name=blk.0.attn_norm.weight, type=0, ne0=4096, ne1=1, ne2=1, ne3=1, nb0=4, nb1=16384, nb2=16384, nb3=16384), ( name=attn_norm-0, type=0, ne0=4096, ne1=128, ne2=1, ne3=1, nb0=4, nb1=16384, nb2=2097152, nb3=2097152), RMS_NORM)
+
+ggml_vk_op_get_pipeline(op=RMS_NORM, src0->mame: Vulkan0#embd#0, src1->name: blk.0.attn_norm.weight, src2->name: NULL, dst->name: attn_norm-0. dst->op: MUL)
+ggml_vk_op_get_pipeline: op==GGML_OP_RMS_NORM and dst->name==attn_norm-0 detected, using QCOM shader with pipeline_rms_norm_mul_f32_qcom
+
+ggml_vk_create_pipeline(Vulkan0, rms_norm_mul_f32_qcom, main, param_count(4), wg_denoms(1,1,1), specialization_constants[2]={0, 1}, disable_robustness(1), require_full_subgroups(0), required_subgroup_size(0), local_size(0, 1, 1)
+ggml_vk_dispatch_pipeline(rms_norm_mul_f32_qcom, elements(128, 1, 1), wg(128,1,1), sending 29 uint32_t uniforms(524288, 4096, 128, 1, 1, 1, 4096, 524288, 524288, 4096, 1, 1, 1, 1, 4096, 4096, 4096, 4096, 128, 1, 1, 1, 4096, 524288, 524288, 0, 897988541, 0, 0)
+*/
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D {float data_d[]; };
+layout(constant_id = 0) const bool norepeat = false;    // specialization_constants[2]={0, 1} -> false
+layout(constant_id = 1) const bool do_multiply = false; // specialization_constants[2]={0, 1} -> true
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+}
+
+uint get_aoffset() {return p.misalign_offsets >> 16;}
+uint get_boffset() {return (p.misalign_offsets >> 8) & 0xFF;}
+uint get_doffset() {return p.misalign_offsets & 0xFF;}
+
+void get_indices(uint idx, out uint i00, out uint i01, out uint i02, out uint i03) {
+    get_indices(idx, i00, i01, i02, i03, p.ne00, p.ne01, p.ne02, p.ne03);
+}
+
+uint src0_idx(uint i00, uint i01, uint i02, uint i03) {
+    return i03 * p.nb03 + i02 * p.nb02 + i01 * p.nb01 + i00 * p.nb00;
+}
+
+uint src1_idx(uint i00, uint i01, uint i02, uint i03) {
+     return fastmod(i03, p.ne13) * p.nb13 + fastmod(i02, p.ne12) * p.nb12 + fastmod(i01, p.ne11) * p.nb11 + fastmod(i00, p.ne10) * p.nb10;
+}
+
+uint dst_idx(uint i00, uint i01, uint i02, uint i03) {
+    return i03 * p.nb23 + i02 * p.nb22 + i01 * p.nb21 + i00 * p.nb20;
+}
+
+shared float sumsh[512];
+
+void rms_norm(uint num_iters) {
+    const uint ncols = p.ne00;
+    const uint nrows = gl_NumWorkGroups.x;
+    const uint nchannels = gl_NumWorkGroups.y;
+
+    const uint row = gl_WorkGroupID.x;
+    const uint channel = gl_WorkGroupID.y;
+    const uint samp = gl_WorkGroupID.z;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint stride_row = p.nb01;
+    const uint stride_channel = p.nb02;
+    const uint stride_sample = p.nb03;
+
+    uint32_t a_offset = samp * stride_sample + channel * stride_channel + row * stride_row + get_aoffset();
+    uint32_t b_offset = src1_idx(0, row, channel, samp) + get_boffset();
+
+    uint32_t d_offset = ((samp * nchannels + channel) * nrows + row) * ncols + get_doffset();
+
+    float sum = float(0.0f);
+
+    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += 512, ++idx) {
+        float xi = float(0);
+        if (col < ncols) {
+            xi = float(data_a[a_offset + col]);
+        }
+        sum += xi * xi;
+    }
+
+    sumsh[tid] = sum;
+
+    barrier();
+    [[unroll]] for (int s = 512 / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+
+    const float mean = sum / float(ncols);
+    const float scale = inversesqrt(mean + float(p.param1));
+    float d;
+    uint idx_in, row_in, col_in, kk, idx_out;
+    // Assuming k % tileK == 0
+    const uint tileK = 16;
+    uint k = p.ne00;
+    uint m_or_n = p.ne01;
+
+    if (ncols > p.ne10) {
+        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += 512, ++idx) {
+            if (col >= ncols) {
+                continue;
+            }
+            //data_d[d_offset + col] = float(scale * float(data_a[a_offset + col]) * float(data_b[b_offset + fastmod(col, p.ne10)]));
+            d = float(scale * float(data_a[a_offset + col]) * float(data_b[b_offset + fastmod(col, p.ne10)]));
+
+            // re-mapping (linear to tileK_first)
+            idx_in = d_offset + col;
+            row_in = idx_in / k;            // rms_norm_mul_f32: uint k = p.ne00;
+            col_in = (idx_in % k) / tileK;
+            kk = idx_in % tileK;
+            idx_out = tileK * (col_in * m_or_n + row_in) + kk; // rms_norm_mul_f32: uint m_or_n = p.ne01;
+
+            data_d[idx_out] = d;
+        }
+    } else {
+        [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += 512, ++idx) {
+            if (col >= ncols) {
+                continue;
+            }
+            //data_d[d_offset + col] = float(scale * float(data_a[a_offset + col]) * float(data_b[b_offset + col]));
+            d = float(scale * float(data_a[a_offset + col]) * float(data_b[b_offset + col]));
+
+            // re-mapping (linear to tileK_first)
+            idx_in = d_offset + col;
+            row_in = idx_in / k;            // rms_norm_mul_f32: uint k = p.ne00;
+            col_in = (idx_in % k) / tileK;
+            kk = idx_in % tileK;
+            idx_out = tileK * (col_in * m_or_n + row_in) + kk; // rms_norm_mul_f32: uint m_or_n = p.ne01;
+
+            data_d[idx_out] = d;
+        }
+    }
+}
+
+void main() {
+    uint num_blocks = (p.ne00 + 512 - 1) / 512;
+    if (num_blocks > 32) {
+        rms_norm(num_blocks);
+    } else if (num_blocks > 16) {
+        rms_norm(32);
+    } else if (num_blocks > 12) {
+        rms_norm(16);
+    } else if (num_blocks > 10) {
+        rms_norm(12);
+    } else if (num_blocks > 8) {
+        rms_norm(10);
+    } else if (num_blocks > 4) {
+        rms_norm(8);
+    } else if (num_blocks == 4) {
+        rms_norm(4);
+    } else if (num_blocks == 3) {
+        rms_norm(3);
+    } else if (num_blocks == 2) {
+        rms_norm(2);
+    } else if (num_blocks == 1) {
+        rms_norm(1);
+    }
+}

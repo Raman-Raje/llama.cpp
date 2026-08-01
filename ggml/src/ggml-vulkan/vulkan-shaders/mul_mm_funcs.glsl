@@ -531,6 +531,47 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 }
 
 #if !defined(MUL_MAT_ID)
+#ifdef B_TILEK_FIRST
+// B uses the TileK-first layout written by the *_qcom producer shaders:
+// element (n, k) is stored at TILEK * ((k / TILEK) * N + n) + k % TILEK, so a
+// full BN x TILEK tile is one contiguous block.
+// Requires K % TILEK == 0, contiguous B with zero misalign offset and a single
+// batch (batch_stride_b/start offsets are not applied).
+void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint idx_n, const uint block, const uint end_k) {
+    const uint TILEK = 16;
+#if LOAD_VEC_B == 8 || LOAD_VEC_B == 4
+    if (ALIGNED != 0) {
+        // LOAD_VEC_B consecutive k values stay inside one TILEK chunk
+        const uint k0 = block + row * LOAD_VEC_B;
+        const uint idx = (TILEK * ((k0 / TILEK) * p.N + idx_n) + k0 % TILEK) / LOAD_VEC_B;
+        const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
+#if LOAD_VEC_B == 8
+        FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
+        buf_b[buf_idx + 0] = bb[0].xy;
+        buf_b[buf_idx + 1] = bb[0].zw;
+        buf_b[buf_idx + 2] = bb[1].xy;
+        buf_b[buf_idx + 3] = bb[1].zw;
+#else
+        FLOAT_TYPEV4 bb = FLOAT_TYPEV4(data_b[idx]);
+        buf_b[buf_idx + 0] = bb.xy;
+        buf_b[buf_idx + 1] = bb.zw;
+#endif
+        return;
+    }
+#endif
+    const uint k0 = block + row * 2;
+    const uint idx = TILEK * ((k0 / TILEK) * p.N + idx_n) + k0 % TILEK;
+    const uint buf_idx = col * SHMEM_STRIDE + row;
+    if (idx_n < p.N && k0 + 1 < end_k) {
+        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]),
+                                      TO_FLOAT_TYPE(data_b_scalar[idx + 1]));
+    } else if (idx_n < p.N && k0 < end_k) {
+        buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b_scalar[idx]), 0.0f);
+    } else {
+        buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
+    }
+}
+#else
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint idx_n, const uint block, const uint end_k) {
 #if LOAD_VEC_B == 8
             if (ALIGNED != 0) {
@@ -569,6 +610,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
                 buf_b[buf_idx] = FLOAT_TYPEV2(0.0f);
             }
 }
+#endif // B_TILEK_FIRST
 #else
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint ic, const uint _ne1, const uint block, const uint end_k) {
 #if LOAD_VEC_B == 8
