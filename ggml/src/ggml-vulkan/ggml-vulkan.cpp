@@ -150,6 +150,8 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
         }                                                           \
     } while (0)
 
+std::vector<std::string> qcom_layer_tilekfirst = { "attn_norm-", "ffn_norm-", "ffn_gate_par-", "kqv_merged_cont-","ffn_swiglu-", "kqv_out-" };
+
 #ifdef GGML_VULKAN_DEBUG
 #define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
 #else
@@ -312,6 +314,9 @@ enum vk_device_architecture {
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
+    QUALCOMM_ADRENO,
+    // [Qcom specific] - Snapdragon Matrix ALUs. First appearing in details for the Snapdragon 8 Elite Gen 6 Pro (SM8975), Adreno 850 GPU
+    QUALCOMM_ADRENO_MALU,    
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -430,7 +435,24 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 return vk_device_architecture::NVIDIA_TURING;
             }
         }
-    }
+    } else if(props.vendorID == VK_VENDOR_ID_QUALCOMM) {
+        VK_LOG_DEBUG("ggml_vulkan: [DEBUG] Qualcomm Adreno GPU detected (vendorID=0x5143, device=\""<< props.deviceName << "\")");
+
+        const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
+        bool cooperative_matrix = false;
+        // Detect "pre-turing" based on lack of coopmat support.
+        for (const auto& properties : ext_props) {
+            if (strcmp("VK_KHR_cooperative_matrix", properties.extensionName) == 0) {
+                cooperative_matrix = true;
+            }
+        }
+
+        // [Qcom specific] -- Find a way to detect GPU version and decide. MAlu present from 
+        if (!cooperative_matrix) {
+            return vk_device_architecture::QUALCOMM_ADRENO;
+        }
+        return vk_device_architecture::QUALCOMM_ADRENO_MALU;
+     }
     return vk_device_architecture::OTHER;
 }
 
@@ -766,6 +788,9 @@ struct vk_device_struct {
     bool mul_mat_id_m_int[GGML_TYPE_COUNT];
     bool mul_mat_id_s_int[GGML_TYPE_COUNT];
 
+    // [Qcom-specific] - output tensors feeding coopmat use TileK-First layout
+    bool coopmat_tile_k_first_layout {};    
+
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
@@ -965,6 +990,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
 
     std::vector<vk_pipeline_ref> all_pipelines;
+
+    // [Qcom-specific] elementwise producers writing TileK-first output and the q4_0 coopmat matmul consuming TileK-first B
+    vk_pipeline pipeline_rms_norm_mul_f32_tilekfirst;
+    vk_pipeline pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst; // QUALCOMM specific shader, optimized for Q4_0 including TileK first layout
+    // vk_pipeline pipeline_mul_f32_f32_f32_tilekfirst;
+    // vk_pipeline pipeline_swiglu_f32_tilekfirst;
+    // vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q4_0_btilek;        
 
     std::vector<std::tuple<void*, size_t, vk_buffer>> pinned_memory;
 
@@ -4384,6 +4416,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
         if (device->coopmat_acc_f16_support) {
+
+            // Qcom specific -- is this right place to have
+            if(device->coopmat_tile_k_first_layout && device->mul_mat_m[GGML_TYPE_Q4_0]) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst, "matmul_q4_0_f32_f16acc_aligned_m_tilekfirst", matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst_len, matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_mmq_wg_denoms, m_warptile_mmq, m_align, false, true);            
+            }
+
             CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -5107,6 +5145,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f32, "rms_norm_mul_rope_f32_f32", rms_norm_mul_rope_f32_f32_len, rms_norm_mul_rope_f32_f32_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f16, "rms_norm_mul_rope_f32_f16", rms_norm_mul_rope_f32_f16_len, rms_norm_mul_rope_f32_f16_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     }
+
+    // [Qcom specific]
+    if (device->coopmat_tile_k_first_layout) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32_tilekfirst, "rms_norm_mul_f32_tilekfirst", rms_norm_mul_f32_tilekfirst_len, rms_norm_mul_f32_tilekfirst_data, "main", 4, sizeof(vk_op_binary_push_constants), { 1, 1, 1 }, { 0, 1 }, 1, true);
+    }    
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
@@ -6437,11 +6480,23 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #endif
             }
 
-            if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
+            // if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
+            // Some devices (e.g. Adreno MALU) only support f16 accumulators
+            if (device->coopmat_m == 0 || (!device->coopmat_acc_f32_support && !device->coopmat_acc_f16_support)) {
                 // No suitable matmul mode found
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
             }
+
+            // Activations feeding coopmat matmuls are stored TileK-first on Adreno
+            // Matrix ALUs. Requires the f16acc shape reported above.
+            device->coopmat_tile_k_first_layout = device->coopmat_support && device->architecture == vk_device_architecture::QUALCOMM_ADRENO_MALU && 
+                                                    device->coopmat_acc_f16_support && getenv("GGML_VK_DISABLE_TILEK_LAYOUT") == nullptr;
+
+            if(device->coopmat_tile_k_first_layout){
+                GGML_LOG_DEBUG("ggml_vulkan: Adreno coopmat found. Needs tileK first layout.\n");
+            }
+                        
             if (getenv("GGML_VK_DISABLE_BFLOAT16")) {
                 device->coopmat_bf16_support = false;
             }
@@ -7235,6 +7290,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
+        bool qcom_layer_found = std::any_of(qcom_layer_tilekfirst.begin(), qcom_layer_tilekfirst.end(), [=](std::string& s) { std::string ss(src1->name); return ss.find(s) != std::string::npos; });
+        if((src0_type == GGML_TYPE_Q4_0)  && qcom_layer_found && (src1->ne[1] > 1)) {
+            std::cerr << "ggml_vk_mul_mat_q_f16: op==GGML_OP_MUL_MAT and src1->name==" << src1->name << " detected, using QCOM shader with pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom\n";
+            mmp.a_m = ctx->device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst; // Overwrite the mul_mat pipeline with qcom version
+        }        
         return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
@@ -10758,6 +10818,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (ctx->do_add_rms_partials) {
                 return ctx->num_additional_fused_ops > 0 ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
             } else {
+                // Qcom specific
+                bool qcom_layer_found = std::any_of(qcom_layer_tilekfirst.begin(), qcom_layer_tilekfirst.end(), [=](std::string& s) { std::string ss(dst->name); return ss.find(s) != std::string::npos; });
+                if( qcom_layer_found && (dst->ne[1] > 1) && (ctx->num_additional_fused_ops > 0) ) {
+                    std::cerr << "ggml_vk_op_get_pipeline: op==GGML_OP_RMS_NORM and dst->name==" << dst->name << " detected, using QCOM shader with pipeline_rms_norm_mul_f32_tilekfirst\n";
+                    return ctx->device->pipeline_rms_norm_mul_f32_tilekfirst;
+                }                
                 return ctx->num_additional_fused_ops > 0 ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
             }
         }
