@@ -648,11 +648,10 @@ void process_shaders() {
 #endif
         }
     }
-#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-    // QUALCOMM: Qcom specific MatMul shader
-    // void string_to_spv_func(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false) {    
-    string_to_spv("matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst", "matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst.comp", { {"K_TILE_FIRST","1"}  }, true, true, false, true);
-    // matmul_q4_0_f32_aligned_f16acc_cm1_qcom
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT) && defined(GGML_VULKAN_COOPMAT_CONVERSION_GLSLC_SUPPORT)
+    // Cooperative-matrix matmul consuming a TileK-first B. string_to_spv
+    // appends "_f16acc_cm1", so this emits matmul_q4_0_f32_tilek_f16acc_cm1.
+    string_to_spv("matmul_q4_0_f32_tilek", "mul_mm_tilek.comp", {}, true, true, false, true);
 #endif
     for (const bool& fp16 : {false, true}) {
         std::map<std::string, std::string> base_dict;
@@ -784,9 +783,9 @@ void process_shaders() {
     string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
-    // Qcom specific - This is expeceted to build for qcom as tileK-frist layout set to 1. Refer rms_norm_f32.comp. TODO: Can we avoid the shader and merge logic into main rms_norm
-    string_to_spv("rms_norm_mul_f32_tilekfirst", "rms_norm_f32.comp",merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"tilek_first","1"}}));
- 
+    // The TileK-first rms_norm variant is the same module as rms_norm_f32, it
+    // only sets the dst_tilek specialization constant.
+
     string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
     string_to_spv("cpy_f16_f16", "copy.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});

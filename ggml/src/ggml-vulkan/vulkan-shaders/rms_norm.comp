@@ -2,6 +2,7 @@
 
 #include "generic_binary_head.glsl"
 #include "types.glsl"
+#include "tile_layout.glsl"
 
 #if RMS_NORM_ROPE_FUSION
 
@@ -33,10 +34,28 @@ layout (binding = 6) readonly buffer R_I {uvec2 rope_data_i[];}; // indices for 
 #define BLOCK_SIZE 512
 
 layout (constant_id = 1) const bool do_multiply = false;
+// Write the result in TileK-first order (see tile_layout.glsl) rather than
+// row-major, for activations that feed a TileK cooperative-matrix matmul.
+layout (constant_id = 2) const bool dst_tilek = false;
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+// Destination index of element (row, col). d_offset already includes
+// get_doffset() and the batch/channel origin of the row.
+uint rms_norm_dst_idx(const uint row, const uint col, const uint d_offset) {
+#if RMS_NORM_ROPE_FUSION
+    // data_d is shared memory holding a single row here, and the fused rope
+    // consumer reads it row-major, so TileK-first does not apply.
+    return d_offset + col;
+#else
+    // TileK-first is only enabled for single-batch tensors, so the row index
+    // alone identifies the destination row and nrows is gl_NumWorkGroups.x.
+    return dst_tilek ? get_doffset() + tilek_first_idx(row, col, gl_NumWorkGroups.x)
+                     : d_offset + col;
+#endif
+}
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -91,14 +110,14 @@ void rms_norm(uint num_iters) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+                data_d[rms_norm_dst_idx(row, col, d_offset)] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
             }
         } else {
             [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                 if (col >= ncols) {
                     continue;
                 }
-                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+                data_d[rms_norm_dst_idx(row, col, d_offset)] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
             }
         }
     } else {
@@ -106,7 +125,7 @@ void rms_norm(uint num_iters) {
             if (col >= ncols) {
                 continue;
             }
-            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+            data_d[rms_norm_dst_idx(row, col, d_offset)] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
         }
     }
 #if RMS_NORM_ROPE_FUSION

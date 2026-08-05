@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -150,7 +151,14 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
         }                                                           \
     } while (0)
 
-std::vector<std::string> qcom_layer_tilekfirst = { "attn_norm-", "ffn_norm-", "ffn_gate_par-", "kqv_merged_cont-","ffn_swiglu-", "kqv_out-" };
+// K dimension of the TileK-first activation layout. Must match TILEK in
+// vulkan-shaders/tile_layout.glsl, and the device's cooperative-matrix K size.
+static constexpr uint32_t GGML_VK_TILEK = 16;
+
+// The TileK matmul uses the vector <-> cooperative-matrix conversion builtins
+// (SPV_QCOM_cooperative_matrix_conversion). There is no Vulkan header macro for
+// this yet, so the extension string is spelled out here.
+static constexpr const char * GGML_VK_COOPMAT_CONVERSION_EXTENSION_NAME = "VK_QCOM_cooperative_matrix_conversion";
 
 #ifdef GGML_VULKAN_DEBUG
 #define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
@@ -315,8 +323,6 @@ enum vk_device_architecture {
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
     QUALCOMM_ADRENO,
-    // [Qcom specific] - Snapdragon Matrix ALUs. First appearing in details for the Snapdragon 8 Elite Gen 6 Pro (SM8975), Adreno 850 GPU
-    QUALCOMM_ADRENO_MALU,    
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -435,24 +441,11 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
                 return vk_device_architecture::NVIDIA_TURING;
             }
         }
-    } else if(props.vendorID == VK_VENDOR_ID_QUALCOMM) {
-        VK_LOG_DEBUG("ggml_vulkan: [DEBUG] Qualcomm Adreno GPU detected (vendorID=0x5143, device=\""<< props.deviceName << "\")");
-
-        const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
-        bool cooperative_matrix = false;
-        // Detect "pre-turing" based on lack of coopmat support.
-        for (const auto& properties : ext_props) {
-            if (strcmp("VK_KHR_cooperative_matrix", properties.extensionName) == 0) {
-                cooperative_matrix = true;
-            }
-        }
-
-        // [Qcom specific] -- Find a way to detect GPU version and decide. MAlu present from 
-        if (!cooperative_matrix) {
-            return vk_device_architecture::QUALCOMM_ADRENO;
-        }
-        return vk_device_architecture::QUALCOMM_ADRENO_MALU;
-     }
+    } else if (props.vendorID == VK_VENDOR_ID_QUALCOMM) {
+        // Only used for tuning. Whether the matrix cores and the TileK layout
+        // are usable is decided from capabilities, not from the architecture.
+        return vk_device_architecture::QUALCOMM_ADRENO;
+    }
     return vk_device_architecture::OTHER;
 }
 
@@ -788,8 +781,12 @@ struct vk_device_struct {
     bool mul_mat_id_m_int[GGML_TYPE_COUNT];
     bool mul_mat_id_s_int[GGML_TYPE_COUNT];
 
-    // [Qcom-specific] - output tensors feeding coopmat use TileK-First layout
-    bool coopmat_tile_k_first_layout {};    
+    // The device exposes the vector <-> cooperative-matrix conversion builtins
+    // that mul_mm_tilek.comp needs.
+    bool coopmat_conversion_support {};
+    // Activations feeding a cooperative-matrix matmul may be produced in the
+    // TileK-first layout (see vulkan-shaders/tile_layout.glsl).
+    bool tilek_activation_layout {};
 
     vk::DescriptorSetLayout dsl;
 
@@ -991,12 +988,11 @@ struct vk_device_struct {
 
     std::vector<vk_pipeline_ref> all_pipelines;
 
-    // [Qcom-specific] elementwise producers writing TileK-first output and the q4_0 coopmat matmul consuming TileK-first B
-    vk_pipeline pipeline_rms_norm_mul_f32_tilekfirst;
-    vk_pipeline pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst; // QUALCOMM specific shader, optimized for Q4_0 including TileK first layout
-    // vk_pipeline pipeline_mul_f32_f32_f32_tilekfirst;
-    // vk_pipeline pipeline_swiglu_f32_tilekfirst;
-    // vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q4_0_btilek;        
+    // Producers writing TileK-first output, and the matmuls consuming a
+    // TileK-first B. Only populated when tilek_activation_layout is set, and
+    // only for the types that have a TileK matmul variant.
+    vk_pipeline pipeline_rms_norm_mul_tilek_f32;
+    vk_pipeline pipeline_matmul_tilek[GGML_TYPE_COUNT];
 
     std::vector<std::tuple<void*, size_t, vk_buffer>> pinned_memory;
 
@@ -2148,6 +2144,15 @@ struct ggml_backend_vk_context {
     // True when prealloc_y holds the padded fp16 layout used by the coopmat2 B decode-vector callback.
     // If false, then it's contiguous.
     bool prealloc_y_last_decode_vector_staging {};
+
+    // Tensors that may be produced in the TileK-first layout: every consumer in
+    // the graph is a matmul that can read that layout. Filled by a pre-pass in
+    // ggml_backend_vk_graph_compute.
+    std::unordered_set<const ggml_tensor *> tilek_candidates;
+    // Subset of the above that a producer actually emitted TileK-first. The
+    // producer inserts into this when it picks a TileK pipeline, and consumers
+    // read it later in the same graph, so the two can never disagree.
+    std::unordered_set<const ggml_tensor *> tilek_tensors;
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
@@ -3995,6 +4000,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+        } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support) {
+            // Adreno's matrix ALUs use a 64x64 cooperative-matrix tile, which
+            // already covers the whole medium workgroup tile. Run one subgroup
+            // per workgroup with a single iteration (BLOCK_SIZE == WARP == 64,
+            // WMITER == 1) instead of the 2x2 sub-tiling the other vendors use.
+            // tm_m/tn_m/tk_m are the coopmat M/N/K here.
+            m_warptile     = { 64, 64, 64, 16, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
+            m_warptile_mmq = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
+            // The mul_mat_id warptiles need the same treatment: their defaults
+            // have WN == 32, which is half the coopmat N, so cms_per_col would
+            // be zero and the shader would accumulate nothing.
+            m_warptile_id    = { 64, 64, 64, 16, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
+            m_warptile_mmqid = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
@@ -4003,6 +4021,32 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_align = 128;
         m_align =  64;
         s_align =  32;
+
+        // Disable any warptile whose geometry the coopmat path of mul_mm.comp
+        // cannot express. It derives cms_per_row = WM/TM and cms_per_col = WN/TN
+        // and sizes its accumulator array from their product, and it derives
+        // warp_r/warp_c assuming (BM/WM)*(BN/WN) subgroups per workgroup. A
+        // coopmat tile larger than the warp tile silently accumulates nothing.
+        // This is a no-op for the 16x16x16 shapes; Adreno reports 64x64x16.
+        if (device->coopmat_support) {
+            auto const &coopmat_geometry_ok = [&](const std::vector<uint32_t> & wt) {
+                const uint32_t block_size = wt[0], bm = wt[1], bn = wt[2], bk = wt[3];
+                const uint32_t wm = wt[4], wn = wt[5];
+                const uint32_t tm = wt[7], tn = wt[8], tk = wt[9], warp = wt[10];
+                return wm >= tm && wm % tm == 0 &&
+                       wn >= tn && wn % tn == 0 &&
+                       bm % wm == 0 && bn % wn == 0 && bk % tk == 0 &&
+                       (bm / wm) * (bn / wn) == block_size / warp;
+            };
+            for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
+                device->mul_mat_l[i]    = device->mul_mat_l[i]    && coopmat_geometry_ok(l_warptile_mmq);
+                device->mul_mat_m[i]    = device->mul_mat_m[i]    && coopmat_geometry_ok(m_warptile_mmq);
+                device->mul_mat_s[i]    = device->mul_mat_s[i]    && coopmat_geometry_ok(s_warptile_mmq);
+                device->mul_mat_id_l[i] = device->mul_mat_id_l[i] && coopmat_geometry_ok(l_warptile_mmqid);
+                device->mul_mat_id_m[i] = device->mul_mat_id_m[i] && coopmat_geometry_ok(m_warptile_mmqid);
+                device->mul_mat_id_s[i] = device->mul_mat_id_s[i] && coopmat_geometry_ok(s_warptile_mmqid);
+            }
+        }
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
@@ -4416,11 +4460,30 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #endif
 
         if (device->coopmat_acc_f16_support) {
+#if defined(GGML_VULKAN_COOPMAT_CONVERSION_GLSLC_SUPPORT)
+            if (device->tilek_activation_layout) {
+                // mul_mm_tilek.comp runs a single subgroup per workgroup and
+                // produces exactly one coopmat tile, so the workgroup tile has
+                // to be the coopmat tile. tilek_activation_layout already
+                // required coopmat_m == coopmat_n == subgroup_size.
+                const uint32_t tilek_bk = 32; // one q4_0 block
+                const std::vector<uint32_t> tilek_warptile = {
+                    device->subgroup_size,                  // BLOCK_SIZE
+                    device->coopmat_m, device->coopmat_n,   // BM, BN
+                    tilek_bk,                               // BK
+                    device->coopmat_m, device->coopmat_n,   // WM, WN
+                    1,                                      // WMITER
+                    device->coopmat_m, device->coopmat_n,   // TM, TN
+                    device->coopmat_k,                      // TK
+                    device->subgroup_size,                  // WARP
+                };
+                const std::array<uint32_t, 3> tilek_wg_denoms = { device->coopmat_m, device->coopmat_n, 1 };
 
-            // Qcom specific -- is this right place to have
-            if(device->coopmat_tile_k_first_layout && device->mul_mat_m[GGML_TYPE_Q4_0]) {
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst, "matmul_q4_0_f32_f16acc_aligned_m_tilekfirst", matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst_len, matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_mmq_wg_denoms, m_warptile_mmq, m_align, false, true);            
+                ggml_vk_create_pipeline(device, device->pipeline_matmul_tilek[GGML_TYPE_Q4_0], "matmul_q4_0_f32_tilek_f16acc",
+                    matmul_q4_0_f32_tilek_f16acc_cm1_len, matmul_q4_0_f32_tilek_f16acc_cm1_data, "main", 3, sizeof(vk_mat_mat_push_constants),
+                    tilek_wg_denoms, ggml_vk_mul_mm_spec(tilek_warptile, true), tilek_bk, false, true, device->subgroup_size);
             }
+#endif
 
             CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
             CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
@@ -5146,10 +5209,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f16, "rms_norm_mul_rope_f32_f16", rms_norm_mul_rope_f32_f16_len, rms_norm_mul_rope_f32_f16_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     }
 
-    // [Qcom specific]
-    if (device->coopmat_tile_k_first_layout) {
-        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32_tilekfirst, "rms_norm_mul_f32_tilekfirst", rms_norm_mul_f32_tilekfirst_len, rms_norm_mul_f32_tilekfirst_data, "main", 4, sizeof(vk_op_binary_push_constants), { 1, 1, 1 }, { 0, 1 }, 1, true);
-    }    
+    // Same module as rms_norm_mul_f32, with dst_tilek (constant_id 2) set.
+    if (device->tilek_activation_layout) {
+        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_tilek_f32, "rms_norm_mul_tilek_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
@@ -5861,6 +5924,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->coopmat_m = 0;
                 device->coopmat_n = 0;
                 device->coopmat_k = 0;
+#if defined(GGML_VULKAN_COOPMAT_CONVERSION_GLSLC_SUPPORT)
+            } else if (strcmp(GGML_VK_COOPMAT_CONVERSION_EXTENSION_NAME, properties.extensionName) == 0 &&
+                       !getenv("GGML_VK_DISABLE_TILEK_LAYOUT")) {
+                device->coopmat_conversion_support = true;
+#endif
 #endif
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
             } else if (strcmp("VK_NV_cooperative_matrix2", properties.extensionName) == 0 &&
@@ -6480,23 +6548,40 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #endif
             }
 
-            // if (device->coopmat_m == 0 || !device->coopmat_acc_f32_support) {
-            // Some devices (e.g. Adreno MALU) only support f16 accumulators
+            // Some devices only report f16 accumulators, which is still usable.
             if (device->coopmat_m == 0 || (!device->coopmat_acc_f32_support && !device->coopmat_acc_f16_support)) {
                 // No suitable matmul mode found
                 GGML_LOG_DEBUG("ggml_vulkan: WARNING: No suitable matrix core mode found. Disabling matrix cores.\n");
                 device->coopmat_support = false;
             }
 
-            // Activations feeding coopmat matmuls are stored TileK-first on Adreno
-            // Matrix ALUs. Requires the f16acc shape reported above.
-            device->coopmat_tile_k_first_layout = device->coopmat_support && device->architecture == vk_device_architecture::QUALCOMM_ADRENO_MALU && 
-                                                    device->coopmat_acc_f16_support && getenv("GGML_VK_DISABLE_TILEK_LAYOUT") == nullptr;
+#if defined(GGML_VULKAN_COOPMAT_CONVERSION_GLSLC_SUPPORT)
+            // TileK-first activations are only worth producing when there is a
+            // matmul that can consume them, i.e. mul_mm_tilek.comp. That shader
+            // needs f16 accumulators, the conversion builtins, and a coopmat
+            // shape whose M/N match the subgroup size (one lane per row/column)
+            // with K equal to the layout's tile depth.
+            // GGML_VK_FORCE_TILEK_LAYOUT skips only the extension check, for
+            // bring-up on drivers that accept the builtins without advertising
+            // the extension. The shape requirements still apply.
+            device->tilek_activation_layout =
+                device->coopmat_support &&
+                device->coopmat_acc_f16_support &&
+                (device->coopmat_conversion_support || getenv("GGML_VK_FORCE_TILEK_LAYOUT") != nullptr) &&
+                device->coopmat_k == GGML_VK_TILEK &&
+                device->coopmat_m == device->subgroup_size &&
+                device->coopmat_n == device->subgroup_size &&
+                getenv("GGML_VK_DISABLE_TILEK_LAYOUT") == nullptr;
 
-            if(device->coopmat_tile_k_first_layout){
-                GGML_LOG_DEBUG("ggml_vulkan: Adreno coopmat found. Needs tileK first layout.\n");
+            if (device->tilek_activation_layout) {
+                GGML_LOG_DEBUG("ggml_vulkan: TileK-first activation layout enabled (coopmat %ux%ux%u, subgroup %u)\n",
+                               device->coopmat_m, device->coopmat_n, device->coopmat_k, device->subgroup_size);
+            } else if (device->coopmat_support && device->coopmat_acc_f16_support && !device->coopmat_conversion_support) {
+                GGML_LOG_DEBUG("ggml_vulkan: TileK-first activation layout unavailable, %s not exposed\n",
+                               GGML_VK_COOPMAT_CONVERSION_EXTENSION_NAME);
             }
-                        
+#endif
+
             if (getenv("GGML_VK_DISABLE_BFLOAT16")) {
                 device->coopmat_bf16_support = false;
             }
@@ -6505,6 +6590,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (device->coopmat_support) {
             device_extensions.push_back("VK_KHR_cooperative_matrix");
         }
+#if defined(GGML_VULKAN_COOPMAT_CONVERSION_GLSLC_SUPPORT)
+        // Only enable what the device actually advertises; the force override
+        // above deliberately does not reach here.
+        if (device->coopmat_conversion_support && device->tilek_activation_layout) {
+            device_extensions.push_back(GGML_VK_COOPMAT_CONVERSION_EXTENSION_NAME);
+        }
+#endif
 #if defined(VK_KHR_shader_bfloat16)
         if (device->coopmat_bf16_support) {
             device_extensions.push_back("VK_KHR_shader_bfloat16");
@@ -7290,11 +7382,6 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
     }
     if (ctx->device->coopmat_support) {
-        bool qcom_layer_found = std::any_of(qcom_layer_tilekfirst.begin(), qcom_layer_tilekfirst.end(), [=](std::string& s) { std::string ss(src1->name); return ss.find(s) != std::string::npos; });
-        if((src0_type == GGML_TYPE_Q4_0)  && qcom_layer_found && (src1->ne[1] > 1)) {
-            std::cerr << "ggml_vk_mul_mat_q_f16: op==GGML_OP_MUL_MAT and src1->name==" << src1->name << " detected, using QCOM shader with pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom\n";
-            mmp.a_m = ctx->device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst; // Overwrite the mul_mat pipeline with qcom version
-        }        
         return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
@@ -8721,7 +8808,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // src1 was written in the TileK-first layout by an earlier node in this
+    // graph, so it can only be read by the matching matmul, and it has to be
+    // read as-is: no requantization to q8_1 and no staging copy.
+    const bool tilek_b = ctx->tilek_tensors.count(src1) > 0;
+    GGML_ASSERT(!tilek_b || (y_f32_kernel && !y_non_contig));
+
+    bool quantize_y = !tilek_b && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
@@ -8749,6 +8842,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
+
+    if (tilek_b) {
+        // Not a heuristic: the layout of src1 already decided this.
+        GGML_ASSERT(!qx_needs_dequant);
+        pipeline = ctx->device->pipeline_matmul_tilek[src0->type];
+        GGML_ASSERT(pipeline != nullptr);
+        GGML_ASSERT(ne10 % pipeline->align == 0);
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -9516,6 +9617,13 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // where the M dimension is very large.
     // Split_k doesn't work with M splitting.
     // This only supports batchsize == 1.
+    // A TileK-first src1 can only be read by the TileK matmul, so it has to go
+    // down the mat-mat path regardless of what the size heuristics prefer.
+    if (ctx->tilek_tensors.count(src1)) {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+        return;
+    }
+
     const size_t nbytes = ggml_nbytes(src0);
     const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
     if (needs_split) {
@@ -10591,6 +10699,16 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+// Whether the fused rms_norm+mul writing dst should emit TileK-first. Used by
+// both the pipeline lookup and the dispatch, so the two cannot disagree about
+// what layout the tensor ended up in.
+static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    return ctx->device->tilek_activation_layout &&
+           !ctx->do_add_rms_partials &&
+           ctx->num_additional_fused_ops == 1 && // rms_norm + mul, no rope
+           ctx->tilek_candidates.count(dst) > 0;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -10817,13 +10935,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
                 return ctx->num_additional_fused_ops > 0 ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
+            } else if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+                return ctx->device->pipeline_rms_norm_mul_tilek_f32;
             } else {
-                // Qcom specific
-                bool qcom_layer_found = std::any_of(qcom_layer_tilekfirst.begin(), qcom_layer_tilekfirst.end(), [=](std::string& s) { std::string ss(dst->name); return ss.find(s) != std::string::npos; });
-                if( qcom_layer_found && (dst->ne[1] > 1) && (ctx->num_additional_fused_ops > 0) ) {
-                    std::cerr << "ggml_vk_op_get_pipeline: op==GGML_OP_RMS_NORM and dst->name==" << dst->name << " detected, using QCOM shader with pipeline_rms_norm_mul_f32_tilekfirst\n";
-                    return ctx->device->pipeline_rms_norm_mul_f32_tilekfirst;
-                }                
                 return ctx->num_additional_fused_ops > 0 ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
             }
         }
@@ -12694,6 +12808,11 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
     } else {
+        // Record the layout before dispatching, so the consuming matmuls later
+        // in this graph pick the matching B loader.
+        if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+            ctx->tilek_tensors.insert(dst);
+        }
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
 
@@ -16290,6 +16409,74 @@ static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const stru
     return num_adds;
 }
 
+// A tensor may only be written in the TileK-first layout if every consumer
+// reads it in that layout, so the decision belongs to the tensor rather than to
+// the producing op. This checks the one consumer shape we support: a mul_mat
+// reading the tensor as B, dispatched through the mat-mat path, with a TileK
+// matmul available for the weight type.
+static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * use, const ggml_tensor * t) {
+    if (use->op != GGML_OP_MUL_MAT || use->src[1] != t) {
+        return false;
+    }
+    const ggml_tensor * a = use->src[0];
+    if (ctx->device->pipeline_matmul_tilek[a->type] == nullptr) {
+        return false;
+    }
+    // mul_mat_vec would read B row-major. Only take over where
+    // ggml_vk_mul_mat() would have picked the mat-mat path anyway.
+    if (use->ne[1] <= mul_mat_vec_max_cols) {
+        return false;
+    }
+    // The TileK matmul walks A one quantization block at a time and indexes B
+    // by whole K-tiles, so K has to divide evenly by both.
+    if (a->ne[0] % ggml_blck_size(a->type) != 0 || a->ne[0] % GGML_VK_TILEK != 0) {
+        return false;
+    }
+    return true;
+}
+
+// Collect the tensors whose consumers all read TileK-first. Producers consult
+// this, and record what they actually emitted in ctx->tilek_tensors.
+static void ggml_vk_find_tilek_candidates(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    ctx->tilek_candidates.clear();
+    ctx->tilek_tensors.clear();
+
+    if (!ctx->device->tilek_activation_layout) {
+        return;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        // tilek_first_idx() addresses a contiguous f32 nrows x K tensor with no
+        // batch dimension, in tiles of GGML_VK_TILEK.
+        if (node->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(node) ||
+            node->ne[0] % GGML_VK_TILEK != 0 ||
+            node->ne[1] <= 1 ||
+            node->ne[2] != 1 || node->ne[3] != 1 ||
+            (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+
+        uint32_t num_uses = 0;
+        bool all_ok = true;
+        for (int j = i + 1; j < cgraph->n_nodes && all_ok; j++) {
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                if (cgraph->nodes[j]->src[s] != node) {
+                    continue;
+                }
+                num_uses++;
+                all_ok = all_ok && ggml_vk_tilek_consumer_ok(ctx, cgraph->nodes[j], node);
+            }
+        }
+
+        if (all_ok && num_uses > 0) {
+            ctx->tilek_candidates.insert(node);
+        }
+    }
+}
+
 static int32_t find_first_set(uint32_t x) {
     int32_t ret = 0;
     if (!x) {
@@ -16316,6 +16503,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
+
+    ggml_vk_find_tilek_candidates(ctx, cgraph);
 
     int last_node = cgraph->n_nodes - 1;
 

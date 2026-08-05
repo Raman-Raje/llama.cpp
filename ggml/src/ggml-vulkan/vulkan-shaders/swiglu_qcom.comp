@@ -1,0 +1,88 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) readonly buffer B { float data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+// ggml_vk_dispatch_pipeline(swiglu_f32_qcom, elements(512, 512, 6), wg(1,512,6), sending 27 uint32_t uniforms(1409024, 11008, 11008, 2, 0, 0, 1, 11008, 1409024, 1409024, 1, 11008, 1409024, 1409024, 1, 11008, 1409024, 1409024, 128, 1, 0, 2097542168, 21, 2097542168, 21, 2097542168, 14)
+layout(push_constant) uniform parameter
+{
+    uint N;    
+    uint ne00; // K=11008 (from sourcr K=ne00=dst->ne[0]
+    uint ne20;
+    uint mode; // -> 2
+    float alpha;
+    float limit;
+    uint nb00;
+    uint nb01;
+    uint nb02;
+    uint nb03;
+    uint nb10;
+    uint nb11;
+    uint nb12;
+    uint nb13;
+    uint nb20;
+    uint nb21;
+    uint nb22;
+    uint nb23;
+    uint ne21; // N=128 (from sourcr N=ne01=dst->ne[1]
+    uint ne22;
+    uint misalign_offsets;
+    uint ne2_012mp; uint ne2_012L;
+    uint ne2_01mp; uint ne2_01L;
+    uint ne2_0mp; uint ne2_0L;
+} p;
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_boffset() { return(p.misalign_offsets >> 8) & 0xFF; }
+uint get_doffset() { return p.misalign_offsets & 0xFF; }
+
+
+uint fastdiv(uint n, uint mp, uint L) {
+    uint msbs, lsbs;
+    umulExtended(n, mp, msbs, lsbs);
+    return(msbs + n) >> L;
+}
+
+float op(float a, float b) {
+    return a / (1.0f + exp(- a)) * b;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (i >= p.N) {
+        return;
+    }
+
+    const uint i23 = fastdiv(i, p.ne2_012mp, p.ne2_012L);
+    const uint i23_offset = i23 * p.ne22 * p.ne21 * p.ne20;
+    const uint i22 = fastdiv(i - i23_offset, p.ne2_01mp, p.ne2_01L);
+    const uint i22_offset = i22 * p.ne21 * p.ne20;
+    const uint i21 = fastdiv(i - i23_offset - i22_offset, p.ne2_0mp, p.ne2_0L);
+    const uint i20 = i - i23_offset - i22_offset - i21 * p.ne20;
+
+    const uint src_idx_a = get_aoffset() + i23 * p.nb03 + i22 * p.nb02 + i21 * p.nb01 + i20 * p.nb00;
+    const uint src_idx_b = get_boffset() + i23 * p.nb13 + i22 * p.nb12 + i21 * p.nb11 + i20 * p.nb10;
+    const uint dst_idx   = get_doffset() + i23 * p.nb23 + i22 * p.nb22 + i21 * p.nb21 + i20 * p.nb20;
+
+    // re-mapping (linear to tileK_first)
+    uint idx_in, row_in, col_in, kk, idx_out;
+    // Assuming k % tileK == 0
+    const uint tileK = 16;
+    uint k = p.ne00;      // K = ne0 -> from vk_op_glu_push_constants(...)  ne00 = dst->ne[0]
+    uint m_or_n = p.ne21; // N = ne1 -> from vk_op_glu_push_constants(...)  ne21 = dst->ne[1]
+
+    idx_in = dst_idx;
+    row_in = idx_in / k;        
+    col_in = (idx_in % k) / tileK;
+    kk = idx_in % tileK;
+    idx_out = tileK * (col_in * m_or_n + row_in) + kk;
+
+    data_d[idx_out] = float(op(float(data_a[src_idx_a]), float(data_b[src_idx_b])));
+}
+
+

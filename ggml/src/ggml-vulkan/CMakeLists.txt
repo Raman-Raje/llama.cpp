@@ -74,6 +74,12 @@ if (Vulkan_FOUND)
     )
 
     test_shader_extension_support(
+        "GL_QCOM_cooperative_matrix_conversion"
+        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat_conversion.comp"
+        "GGML_VULKAN_COOPMAT_CONVERSION_GLSLC_SUPPORT"
+    )
+
+    test_shader_extension_support(
         "GL_NV_cooperative_matrix2"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
         "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
