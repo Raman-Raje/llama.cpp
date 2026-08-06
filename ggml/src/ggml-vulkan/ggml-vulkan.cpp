@@ -917,9 +917,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
-    // TileK-first variants of the above: same shader modules with dst_tilek
-    // specialized on. f32 only, since the layout is defined for f32.
-    vk_pipeline pipeline_glu_tilek_f32[GGML_GLU_OP_COUNT];
+    // SwiGLU writing TileK-first output (swiglu_tilek.comp). f32 only, since
+    // the layout is defined for f32.
+    vk_pipeline pipeline_swiglu_tilek_f32;
 
     vk_pipeline pipeline_leaky_relu[2];
     vk_pipeline pipeline_silu_back_f32;
@@ -5385,20 +5385,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_fill_f32, "fill_f32", fill_f32_len, fill_f32_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_fill_f16, "fill_f16", fill_f16_len, fill_f16_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
-#define CREATE_GLU(name, op)  \
+#define CREATE_GLU(name)  \
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);   \
-    ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);   \
-    if (device->tilek_activation_layout) {   \
-        ggml_vk_create_pipeline(device, device->pipeline_glu_tilek_f32[op], #name "_tilek_f32", name ## _f32_len, name ## _f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {1}, 1, true);   \
-    }
+    ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
 
-    CREATE_GLU(geglu,       GGML_GLU_OP_GEGLU)
-    CREATE_GLU(reglu,       GGML_GLU_OP_REGLU)
-    CREATE_GLU(swiglu,      GGML_GLU_OP_SWIGLU)
-    CREATE_GLU(swiglu_oai,  GGML_GLU_OP_SWIGLU_OAI)
-    CREATE_GLU(geglu_erf,   GGML_GLU_OP_GEGLU_ERF)
-    CREATE_GLU(geglu_quick, GGML_GLU_OP_GEGLU_QUICK)
+    CREATE_GLU(geglu)
+    CREATE_GLU(reglu)
+    CREATE_GLU(swiglu)
+    CREATE_GLU(swiglu_oai)
+    CREATE_GLU(geglu_erf)
+    CREATE_GLU(geglu_quick)
 #undef CREATE_GLU
+
+#if defined(GGML_VULKAN_COOPMAT_CONVERSION_GLSLC_SUPPORT)
+    if (device->tilek_activation_layout) {
+        ggml_vk_create_pipeline(device, device->pipeline_swiglu_tilek_f32, "swiglu_tilek_f32", swiglu_tilek_f32_len, swiglu_tilek_f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
+    }
+#endif
 
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -10724,12 +10727,13 @@ static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, cons
 }
 
 // Same contract for GLU: consulted by the pipeline lookup and by the dispatch
-// that records the layout, so the two cannot disagree.
+// that records the layout, so the two cannot disagree. Only SwiGLU has a TileK
+// shader; the other GLU ops keep the shared row-major path.
 static bool ggml_vk_glu_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
-    if (!ctx->device->tilek_activation_layout || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-    return ctx->device->pipeline_glu_tilek_f32[ggml_get_glu_op(dst)] != nullptr &&
+    return ctx->device->tilek_activation_layout &&
+           dst->type == GGML_TYPE_F32 &&
+           ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU &&
+           ctx->device->pipeline_swiglu_tilek_f32 != nullptr &&
            ctx->tilek_candidates.count(dst) > 0;
 }
 
@@ -11040,7 +11044,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
 
         if (ggml_vk_glu_use_tilek(ctx, dst)) {
-            return ctx->device->pipeline_glu_tilek_f32[ggml_get_glu_op(dst)];
+            return ctx->device->pipeline_swiglu_tilek_f32;
         }
 
         switch (ggml_get_glu_op(dst)) {

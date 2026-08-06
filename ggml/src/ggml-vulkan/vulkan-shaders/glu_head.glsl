@@ -1,10 +1,5 @@
 #extension GL_EXT_shader_16bit_storage : require
 
-#include "tile_layout.glsl"
-
-// Write the result in TileK-first order (see tile_layout.glsl) rather than
-// row-major, for activations that feed a TileK cooperative-matrix matmul.
-layout (constant_id = 0) const bool dst_tilek = false;
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
