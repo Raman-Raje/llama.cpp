@@ -14,7 +14,12 @@ void main() {
 
     const uint src_idx_a = get_aoffset() + i23 * p.nb03 + i22 * p.nb02 + i21 * p.nb01 + i20 * p.nb00;
     const uint src_idx_b = get_boffset() + i23 * p.nb13 + i22 * p.nb12 + i21 * p.nb11 + i20 * p.nb10;
-    const uint dst_idx = get_doffset() + i23 * p.nb23 + i22 * p.nb22 + i21 * p.nb21 + i20 * p.nb20;
+    // i20 indexes dst->ne[0] (the K dimension) and i21 indexes dst->ne[1] (the
+    // row), which is exactly what tilek_first_idx wants. TileK-first is only
+    // enabled for single-batch tensors, so i22/i23 are zero there.
+    const uint dst_idx = dst_tilek
+        ? get_doffset() + tilek_first_idx(i21, i20, p.ne21)
+        : get_doffset() + i23 * p.nb23 + i22 * p.nb22 + i21 * p.nb21 + i20 * p.nb20;
 
     if (p.mode == 0) {
         // Default

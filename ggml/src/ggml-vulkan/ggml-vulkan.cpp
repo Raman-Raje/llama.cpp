@@ -917,6 +917,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
+    // TileK-first variants of the above: same shader modules with dst_tilek
+    // specialized on. f32 only, since the layout is defined for f32.
+    vk_pipeline pipeline_glu_tilek_f32[GGML_GLU_OP_COUNT];
 
     vk_pipeline pipeline_leaky_relu[2];
     vk_pipeline pipeline_silu_back_f32;
@@ -4330,27 +4333,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         return spec;
     };
 
-    // The matmul pipelines request full subgroups. With that flag and no
-    // explicit size, Vulkan requires local_size_x to be a multiple of
-    // maxSubgroupSize (VUID-VkPipelineShaderStageCreateInfo-flags-02756), which
-    // a warptile running a single subgroup narrower than that does not satisfy.
-    // Pin the size to the warptile's WARP in that case; 0 means "don't pin",
-    // which is the historical behaviour.
-    auto const &ggml_vk_mm_required_subgroup_size = [&](const std::vector<uint32_t> & warptile) -> uint32_t {
-        const uint32_t block_size = warptile[0];
-        const uint32_t warp       = warptile[10];
-        if (!device->subgroup_size_control || device->subgroup_max_size == 0 ||
-            block_size % device->subgroup_max_size == 0) {
-            return 0;
-        }
-        if (warp < device->subgroup_min_size || warp > device->subgroup_max_size) {
-            GGML_LOG_DEBUG("ggml_vulkan: WARNING: warptile WARP=%u outside the device subgroup range [%u,%u]\n",
-                           warp, device->subgroup_min_size, device->subgroup_max_size);
-            return 0;
-        }
-        return warp;
-    };
-
     const int mul_mat_id_param_count = 5;
 
 #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
@@ -4449,17 +4431,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Create 6 variants, {s,m,l}x{unaligned,aligned}
 #define CREATE_MM(TYPE, PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true, ggml_vk_mm_required_subgroup_size(l_ ## WARPTILE));   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, false), 1, false, true);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true, ggml_vk_mm_required_subgroup_size(m_ ## WARPTILE));   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->m, #NAMELC #F16ACC "_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, false), 1, false, true);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true, ggml_vk_mm_required_subgroup_size(s_ ## WARPTILE));   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->s, #NAMELC #F16ACC "_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, false), 1, false, true);   \
         if (device->mul_mat ## ID ## _l[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true, ggml_vk_mm_required_subgroup_size(l_ ## WARPTILE));   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, ggml_vk_mul_mm_spec(l_ ## WARPTILE, true), l_align, false, true);   \
         if (device->mul_mat ## ID ## _m[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true, ggml_vk_mm_required_subgroup_size(m_ ## WARPTILE));   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_m, #NAMELC #F16ACC "_aligned_m", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), m_ ## WG_DENOMS, ggml_vk_mul_mm_spec(m_ ## WARPTILE, true), m_align, false, true);   \
         if (device->mul_mat ## ID ## _s[TYPE]) \
-            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true, ggml_vk_mm_required_subgroup_size(s_ ## WARPTILE));   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_s, #NAMELC #F16ACC "_aligned_s", NAMELC ## F16ACC ## _cm1_len, NAMELC ## F16ACC ## _cm1_data, "main", PARAMCOUNT, sizeof(PUSHCONST), s_ ## WG_DENOMS, ggml_vk_mul_mm_spec(s_ ## WARPTILE, true), s_align, false, true);   \
 
         // Create 2 variants, {f16,f32} accumulator
 #define CREATE_MM2(TYPE, PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT, ID) \
@@ -5403,16 +5385,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_fill_f32, "fill_f32", fill_f32_len, fill_f32_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_fill_f16, "fill_f16", fill_f16_len, fill_f16_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
-#define CREATE_GLU(name)  \
+#define CREATE_GLU(name, op)  \
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);   \
-    ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);   \
+    if (device->tilek_activation_layout) {   \
+        ggml_vk_create_pipeline(device, device->pipeline_glu_tilek_f32[op], #name "_tilek_f32", name ## _f32_len, name ## _f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {1}, 1, true);   \
+    }
 
-    CREATE_GLU(geglu)
-    CREATE_GLU(reglu)
-    CREATE_GLU(swiglu)
-    CREATE_GLU(swiglu_oai)
-    CREATE_GLU(geglu_erf)
-    CREATE_GLU(geglu_quick)
+    CREATE_GLU(geglu,       GGML_GLU_OP_GEGLU)
+    CREATE_GLU(reglu,       GGML_GLU_OP_REGLU)
+    CREATE_GLU(swiglu,      GGML_GLU_OP_SWIGLU)
+    CREATE_GLU(swiglu_oai,  GGML_GLU_OP_SWIGLU_OAI)
+    CREATE_GLU(geglu_erf,   GGML_GLU_OP_GEGLU_ERF)
+    CREATE_GLU(geglu_quick, GGML_GLU_OP_GEGLU_QUICK)
 #undef CREATE_GLU
 
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
@@ -6582,25 +6567,33 @@ static vk_device ggml_vk_get_device(size_t idx) {
             // needs f16 accumulators, the conversion builtins, and a coopmat
             // shape whose M/N match the subgroup size (one lane per row/column)
             // with K equal to the layout's tile depth.
-            // GGML_VK_FORCE_TILEK_LAYOUT skips only the extension check, for
-            // bring-up on drivers that accept the builtins without advertising
-            // the extension. The shape requirements still apply.
-            device->tilek_activation_layout =
-                device->coopmat_support &&
-                device->coopmat_acc_f16_support &&
-                (device->coopmat_conversion_support || getenv("GGML_VK_FORCE_TILEK_LAYOUT") != nullptr) &&
-                device->coopmat_k == GGML_VK_TILEK &&
-                device->coopmat_m == device->subgroup_size &&
-                device->coopmat_n == device->subgroup_size &&
-                getenv("GGML_VK_DISABLE_TILEK_LAYOUT") == nullptr;
-
-            if (device->tilek_activation_layout) {
-                GGML_LOG_DEBUG("ggml_vulkan: TileK-first activation layout enabled (coopmat %ux%ux%u, subgroup %u)\n",
-                               device->coopmat_m, device->coopmat_n, device->coopmat_k, device->subgroup_size);
-            } else if (device->coopmat_support && device->coopmat_acc_f16_support && !device->coopmat_conversion_support) {
-                GGML_LOG_DEBUG("ggml_vulkan: TileK-first activation layout unavailable, %s not exposed\n",
-                               GGML_VK_COOPMAT_CONVERSION_EXTENSION_NAME);
+            // Every TileK pipeline hangs off this one flag, so name the first
+            // unmet requirement: a silently disabled feature is very hard to
+            // tell from a broken one. GGML_VK_FORCE_TILEK_LAYOUT skips only the
+            // extension check, for bring-up on drivers that accept the builtins
+            // without advertising it; the shape requirements still apply.
+            std::string tilek_blocker;
+            if (getenv("GGML_VK_DISABLE_TILEK_LAYOUT")) {
+                tilek_blocker = "disabled by GGML_VK_DISABLE_TILEK_LAYOUT";
+            } else if (!device->coopmat_support) {
+                tilek_blocker = "no cooperative matrix support";
+            } else if (!device->coopmat_acc_f16_support) {
+                tilek_blocker = "no f16 cooperative matrix accumulator";
+            } else if (!device->coopmat_conversion_support && !getenv("GGML_VK_FORCE_TILEK_LAYOUT")) {
+                tilek_blocker = std::string(GGML_VK_COOPMAT_CONVERSION_EXTENSION_NAME) +
+                                " not advertised (set GGML_VK_FORCE_TILEK_LAYOUT=1 to override)";
+            } else if (device->coopmat_k != GGML_VK_TILEK) {
+                tilek_blocker = "cooperative matrix K != " + std::to_string(GGML_VK_TILEK) + ", the TileK tile depth";
+            } else if (device->coopmat_m != device->subgroup_size || device->coopmat_n != device->subgroup_size) {
+                tilek_blocker = "cooperative matrix M/N != subgroup size, needed for one lane per row/column";
             }
+
+            device->tilek_activation_layout = tilek_blocker.empty();
+
+            GGML_LOG_DEBUG("ggml_vulkan: TileK-first activation layout %s (coopmat %ux%ux%u, subgroup %u)%s%s\n",
+                           device->tilek_activation_layout ? "enabled" : "off",
+                           device->coopmat_m, device->coopmat_n, device->coopmat_k, device->subgroup_size,
+                           tilek_blocker.empty() ? "" : ": ", tilek_blocker.c_str());
 #endif
 
             if (getenv("GGML_VK_DISABLE_BFLOAT16")) {
@@ -10730,6 +10723,16 @@ static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, cons
            ctx->tilek_candidates.count(dst) > 0;
 }
 
+// Same contract for GLU: consulted by the pipeline lookup and by the dispatch
+// that records the layout, so the two cannot disagree.
+static bool ggml_vk_glu_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    if (!ctx->device->tilek_activation_layout || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    return ctx->device->pipeline_glu_tilek_f32[ggml_get_glu_op(dst)] != nullptr &&
+           ctx->tilek_candidates.count(dst) > 0;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -11034,6 +11037,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) ||
             (src0->type != dst->type)) {
             return nullptr;
+        }
+
+        if (ggml_vk_glu_use_tilek(ctx, dst)) {
+            return ctx->device->pipeline_glu_tilek_f32[ggml_get_glu_op(dst)];
         }
 
         switch (ggml_get_glu_op(dst)) {
@@ -12887,6 +12894,13 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
     }
 
     const uint32_t mode = split ? 2 : (swapped ? 1 : 0);
+
+    // Record the layout before dispatching, so the consuming matmuls later in
+    // this graph pick the matching B loader.
+    if (ggml_vk_glu_use_tilek(ctx, dst)) {
+        ctx->tilek_tensors.insert(dst);
+    }
+
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = split ? ggml_type_size(src1->type) : src0_type_size;
     const uint32_t dst_type_size  = ggml_type_size(dst->type);
