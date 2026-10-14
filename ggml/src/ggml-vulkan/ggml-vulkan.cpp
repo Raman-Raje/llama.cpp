@@ -8641,6 +8641,29 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+// Whether the fused rms_norm+mul writing dst should emit TileK-first. Used by
+// both the pipeline lookup and the dispatch, so the two cannot disagree about
+// what layout the tensor ended up in.
+static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+   VK_LOG_DEBUG("ggml_vk_rms_norm_use_tilek( Tilek layout =" << ctx->device->tilek_activation_layout << ", TileK candidates =" << ctx->tilek_candidates.count(dst));
+
+   return ctx->device->tilek_activation_layout &&
+          !ctx->do_add_rms_partials &&
+          ctx->num_additional_fused_ops == 1 && // rms_norm + mul, no rope
+          ctx->tilek_candidates.count(dst) > 0;
+}
+
+// Same contract for GLU: consulted by the pipeline lookup and by the dispatch
+// that records the layout, so the two cannot disagree. Only SwiGLU has a TileK
+// shader; the other GLU ops keep the shared row-major path.
+static bool ggml_vk_glu_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+   return ctx->device->tilek_activation_layout &&
+          dst->type == GGML_TYPE_F32 &&
+          ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU &&
+          ctx->device->pipeline_swiglu_tilek_f32 != nullptr &&
+          ctx->tilek_candidates.count(dst) > 0;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -8879,9 +8902,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_RMS_NORM:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             if (ctx->do_add_rms_partials) {
-                return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
-            }
-            return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
+                return ctx->num_additional_fused_ops > 0 ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
+           } else if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+               return ctx->device->pipeline_rms_norm_mul_tilek_f32;
+           } else {
+               return ctx->num_additional_fused_ops > 0 ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
+           }
         }
         return nullptr;
     case GGML_OP_RMS_NORM_BACK:
@@ -8956,6 +8982,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             (src0->type != dst->type)) {
             return nullptr;
         }
+
+        if (ggml_vk_glu_use_tilek(ctx, dst)) {
+            return ctx->device->pipeline_swiglu_tilek_f32;
+        }        
 
         switch (ggml_get_glu_op(dst)) {
             case GGML_GLU_OP_GEGLU:
@@ -10971,6 +11001,12 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
     } else {
+
+        // Record the layout before dispatching, so the consuming matmuls later
+        // in this graph pick the matching B loader.
+        if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+            ctx->tilek_tensors.insert(dst);
+        }        
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
@@ -11019,6 +11055,12 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
         GGML_ASSERT(src0->ne[0] == dst->ne[0]);
         GGML_ASSERT(src0->type == src1->type);
     }
+
+    // Record the layout before dispatching, so the consuming matmuls later in
+    // this graph pick the matching B loader.
+    if (ggml_vk_glu_use_tilek(ctx, dst)) {
+        ctx->tilek_tensors.insert(dst);
+    }    
 
     const uint32_t mode = split ? 2 : (swapped ? 1 : 0);
     const uint32_t src0_type_size = ggml_type_size(src0->type);
@@ -14233,6 +14275,112 @@ static int32_t find_first_set(uint32_t x) {
         ret++;
     }
     return ret;
+}
+
+// A tensor may only be written in the TileK-first layout if every consumer
+// reads it in that layout, so the decision belongs to the tensor rather than to
+// the producing op. This checks the one consumer shape we support: a mul_mat
+// reading the tensor as B, dispatched through the mat-mat path, with a TileK
+// matmul available for the weight type.
+static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * use, const ggml_tensor * t) {
+   if (use->op != GGML_OP_MUL_MAT || use->src[1] != t) {
+       return false;
+   }
+   const ggml_tensor * a = use->src[0];
+   if (ctx->device->pipeline_matmul_tilek[a->type] == nullptr) {
+       return false;
+   }
+   // mul_mat_vec would read B row-major. Only take over where
+   // ggml_vk_mul_mat() would have picked the mat-mat path anyway.
+   if (use->ne[1] <= mul_mat_vec_max_cols) {
+       return false;
+   }
+   // The TileK matmul walks A one quantization block at a time and indexes B
+   // by whole K-tiles, so K has to divide evenly by both.
+   if (a->ne[0] % ggml_blck_size(a->type) != 0 || a->ne[0] % GGML_VK_TILEK != 0) {
+       return false;
+   }
+   return true;
+}
+
+// Collect the tensors whose consumers all read TileK-first. Producers consult
+// this, and record what they actually emitted in ctx->tilek_tensors.
+static void ggml_vk_find_tilek_candidates(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+   ctx->tilek_candidates.clear();
+   ctx->tilek_tensors.clear();
+   ctx->tilek_fa_views.clear();
+
+   if (!ctx->device->tilek_activation_layout) {
+       return;
+   }
+
+   for (int i = 0; i < cgraph->n_nodes; i++) {
+       const ggml_tensor * node = cgraph->nodes[i];
+
+       // tilek_first_idx() addresses a contiguous f32 nrows x K tensor with no
+       // batch dimension, in tiles of GGML_VK_TILEK.
+       if (node->type != GGML_TYPE_F32 ||
+           !ggml_is_contiguous(node) ||
+           node->ne[0] % GGML_VK_TILEK != 0 ||
+           node->ne[1] <= 1 ||
+           node->ne[2] != 1 || node->ne[3] != 1 ||
+           (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+           continue;
+       }
+
+       uint32_t num_uses = 0;
+       bool all_ok = true;
+       for (int j = i + 1; j < cgraph->n_nodes && all_ok; j++) {
+           for (int s = 0; s < GGML_MAX_SRC; s++) {
+               if (cgraph->nodes[j]->src[s] != node) {
+                   continue;
+               }
+               num_uses++;
+               all_ok = all_ok && ggml_vk_tilek_consumer_ok(ctx, cgraph->nodes[j], node);
+           }
+       }
+
+       if (all_ok && num_uses > 0) {
+           ctx->tilek_candidates.insert(node);
+       }
+   }
+   // Second pass: attribute a candidate reshape back to a flash attention node.
+   // FA's own output is [HSV, n_head, n_tokens], which the shape check above
+   // rejects for ne[2] != 1, but the reshape that follows it is the 2D operand
+   // the matmul actually reads, and FA already writes its elements in exactly
+   // that row-major order. So FA can produce the layout for the reshape.
+   for (int i = 0; i < cgraph->n_nodes; i++) {
+       const ggml_tensor * view = cgraph->nodes[i];
+
+       if (view->op != GGML_OP_RESHAPE || ctx->tilek_candidates.count(view) == 0) {
+           continue;
+       }
+
+       const ggml_tensor * fa = view->src[0];
+       if (fa->op != GGML_OP_FLASH_ATTN_EXT || fa->type != GGML_TYPE_F32 || !ggml_is_contiguous(fa)) {
+           continue;
+       }
+       // A whole-tensor reshape to [HSV*n_head, n_tokens]: the row count has to
+       // be FA's n_tokens (its ne[2]), or the remap's notion of a row is wrong.
+       if (ggml_nelements(fa) != ggml_nelements(view) || view->ne[1] != fa->ne[2] || fa->ne[3] != 1) {
+           continue;
+       }
+       // Anything else reading FA directly would read it row-major.
+       bool only_use = true;
+       for (int j = 0; j < cgraph->n_nodes && only_use; j++) {
+           for (int s = 0; s < GGML_MAX_SRC; s++) {
+               if (cgraph->nodes[j]->src[s] == fa && cgraph->nodes[j] != view) {
+                   only_use = false;
+                   break;
+               }
+           }
+       }
+       if (!only_use) {
+           continue;
+       }
+
+       ctx->tilek_fa_views[fa] = view;
+   }
 }
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {

@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -210,6 +211,16 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
                 "ggml_vulkan: " msg);                               \
         }                                                           \
     } while (0)
+
+// std::vector<std::string> qcom_layer_tilekfirst = { "attn_norm-", "ffn_norm-", "ffn_gate_par-", "kqv_merged_cont-","ffn_swiglu-", "kqv_out-" };
+// K dimension of the TileK-first activation layout. Must match TILEK in vulkan-shaders/tile_layout.glsl, and the device's cooperative-matrix K size.
+static constexpr uint32_t GGML_VK_TILEK = 16;
+
+// The TileK matmul uses the vector <-> cooperative-matrix conversion builtins (SPV_QCOM_cooperative_matrix_conversion).
+#ifndef VK_QCOM_COOPERATIVE_MATRIX_CONVERSION_EXTENSION_NAME
+#define VK_QCOM_COOPERATIVE_MATRIX_CONVERSION_EXTENSION_NAME "VK_QCOM_cooperative_matrix_conversion"
+#endif
+static constexpr const char * GGML_VK_COOPMAT_CONVERSION_EXTENSION_NAME = "VK_QCOM_cooperative_matrix_conversion";
 
 #ifdef GGML_VULKAN_DEBUG
 #define VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
@@ -779,6 +790,11 @@ struct vk_device_struct {
     bool mul_mat_id_m_int[GGML_TYPE_COUNT];
     bool mul_mat_id_s_int[GGML_TYPE_COUNT];
 
+    // [Qcom-specific] - The device exposes the vector <-> cooperative-matrix conversion builtins, mul_mm_tilek.comp needs.
+    bool coopmat_conversion_support {};
+    // Activations feeding a cooperative-matrix matmul may be produced in the TileK-first layout (see vulkan-shaders/tile_layout.glsl).
+    bool tilek_activation_layout {};
+
     vk::DescriptorSetLayout dsl;
 
     std::map<vk_matmul_pipeline_key, std::vector<vk_matmul_pipeline_pair>> pipeline_matmul;
@@ -909,6 +925,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
 
+    // SwiGLU writing TileK-first output (swiglu_tilek.comp). f32 only, since the layout is defined for f32.
+    vk_pipeline pipeline_swiglu_tilek_f32;
+
     vk_pipeline pipeline_leaky_relu[2];
     vk_pipeline pipeline_silu_back_f32;
     vk_pipeline pipeline_diag_mask_inf_f32;
@@ -995,6 +1014,13 @@ struct vk_device_struct {
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
+
+    // [Qcom-specific] elementwise producers writing TileK-first output and the q4_0 coopmat matmul consuming TileK-first B  
+    // Producers writing TileK-first output, and the matmuls consuming a
+    // TileK-first B. Only populated when tilek_activation_layout is set, and
+    // only for the types that have a TileK matmul variant.
+    vk_pipeline pipeline_rms_norm_mul_tilek_f32;
+    vk_pipeline pipeline_matmul_tilek[GGML_TYPE_COUNT];    
 
     std::vector<vk_pipeline_ref> all_pipelines;
 
@@ -1242,6 +1268,22 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+
+    // [Qcom specific]
+    // Tensors that may be produced in the TileK-first layout: every consumer in
+    // the graph is a matmul that can read that layout. Filled by a pre-pass in
+    // ggml_backend_vk_graph_compute.
+    std::unordered_set<const ggml_tensor *> tilek_candidates;
+    // Subset of the above that a producer actually emitted TileK-first. The
+    // producer inserts into this when it picks a TileK pipeline, and consumers
+    // read it later in the same graph, so the two can never disagree.
+    std::unordered_set<const ggml_tensor *> tilek_tensors;
+
+    // Flash attention writes a 3D [HSV, n_head, n_tokens] tensor that the graph
+    // immediately reshapes to the 2D [HSV*n_head, n_tokens] operand the wo
+    // matmul consumes. The candidate is that reshape, but the producer is the
+    // flash attention node, so map one to the other. Filled by the same pre-pass.
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> tilek_fa_views;    
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
