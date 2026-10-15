@@ -1376,7 +1376,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type, bool tilekfirst) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1388,7 +1388,7 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, tilekfirst};
 }
 
 static uint32_t fa_block_bytes(ggml_type t) {
@@ -2061,7 +2061,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     if (f32acc) { spv_data = flash_attn_f32_f16_dot2_data;        spv_size = flash_attn_f32_f16_dot2_len; }
                     else        { spv_data = flash_attn_f32_f16_dot2_f16acc_data; spv_size = flash_attn_f32_f16_dot2_f16acc_len; }
                 } else {
-                    if (f32acc) { spv_data = flash_attn_f32_f16_data;        spv_size = flash_attn_f32_f16_len; }
+                    if (f32acc)
+                    {
+                        if (fa.first.tilekfirst)
+                        {
+                            // QUALCOMM specific: same shader as pipeline_flash_attn_f32_f16,
+                            // but includes different (tileK_first) layout. Different output layout to feed a different mul_mm.comp
+                            spv_data = flash_attn_f32_f16_align_qcom_data;
+                            spv_size = flash_attn_f32_f16_align_qcom_len;
+#ifdef GGML_VULKAN_SHADER_DEBUG_INFO
+                            std::cerr << "ggml_vk_create_pipeline: using QCOM flash_attn_f32_f16_align_qcom shader\n";
+#endif
+                        }
+                        else
+                        {
+                            spv_data = flash_attn_f32_f16_data;
+                            spv_size = flash_attn_f32_f16_len;
+                        }
+                    }
                     else        { spv_data = flash_attn_f32_f16_f16acc_data; spv_size = flash_attn_f32_f16_f16acc_len; }
                 }
             } else {
@@ -2474,6 +2491,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             FOR_EACH_LUT_FP4_TYPE(X_CM1)
         }
 #undef X_CM1
+
+        // QUALCOMM: Add this specif pipeline for QCOM specific MxM Q4_0 shader
+        if (device->coopmat_acc_f16_support && device->mul_mat_m[GGML_TYPE_Q4_0]) {
+            std::array<uint32_t, 3> qcom_mmq_wg_denoms = {128, 128, 1};
+            uint32_t qcom_align = 128;
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom, "matmul_q4_0_f32_f16acc_aligned_m_tilekfirst_qcom", matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst_qcom_len, matmul_q4_0_f32_aligned_f16acc_cm1_tilekfirst_qcom_data, "main", 3, sizeof(vk_mat_mat_push_constants), qcom_mmq_wg_denoms, m_warptile_mmq, qcom_align, false, true);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_qcom, "matmul_q4_0_f32_f16acc_aligned_m_qcom", matmul_q4_0_f32_aligned_f16acc_cm1_qcom_len, matmul_q4_0_f32_aligned_f16acc_cm1_qcom_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_mmq_wg_denoms, m_warptile_mmq, m_align, false, true);
+        }
 
         if (device->coopmat_int_support && (rdna3 || rdna4)) {
             cm1_create_mmq({GGML_TYPE_Q4_0,   GGML_TYPE_Q8_1, false, false}, tc_mmq_cm1_int,   "matmul_q4_0_q8_1",   matmul_q4_0_q8_1_cm1_len,   matmul_q4_0_q8_1_cm1_data,   sizeof(vk_mat_mat_push_constants), 3);
@@ -3256,6 +3281,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    // QUALCOMM specific: same shader as rms_norm_mul_f32, but includes different (tileK_first) output layout
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32_qcom, "rms_norm_mul_f32_qcom", rms_norm_mul_f32_qcom_len, rms_norm_mul_f32_qcom_data, "main", 4, sizeof(vk_op_binary_push_constants), { 1, 1, 1 }, { 0, 1 }, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -3369,6 +3396,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 
+    // QUALCOMM Specific shader, different output layout to feed a different mul_mm.comp
+    ggml_vk_create_pipeline(device, device->pipeline_mul_f32_f32_f32_qcom,"mul_f32_f32_f32_qcom", mul_f32_f32_f32_qcom_len, mul_f32_f32_f32_qcom_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
@@ -3475,6 +3505,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(geglu)
     CREATE_GLU(reglu)
     CREATE_GLU(swiglu)
+    // QUALCOMM specific: same shader as swiglu_f32, but includes different (tileK_first) output layout
+    ggml_vk_create_pipeline(device, device->pipeline_swiglu_f32_qcom, "swiglu_f32_qcom", swiglu_f32_qcom_len, swiglu_f32_qcom_data, "main", 3, sizeof(vk_op_glu_push_constants), { 512, 1, 1 }, {}, 1, true);
     CREATE_GLU(swiglu_oai)
     CREATE_GLU(swiglu_clamp)
     CREATE_GLU(geglu_erf)
@@ -6385,8 +6417,17 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // coopmat shaders are fast enough that memory bandwidth reduction from f16 activations helps
     const bool prefer_f16_b = is_coopmat && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32;
 
+    // QUALCOMM: layers with output to mat_mm (QUALCOMM CoopMat) should have different layout.
+    // src1 is tagged by ggml_vk_tag_qcom_tilekfirst() when its producer wrote tileK-first output.
+    // Different layout will avoid cache issues and increase the QCOM MxM performance.
+    // The QCOM shader reads src1 as f32 directly, so f16/q8_1 conversion of src1 is skipped.
+    const bool qcom_tilekfirst = ctx->device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom != nullptr &&
+                                 src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32 &&
+                                 (uintptr_t)src1->extra != 0 && ne11 > 1 &&
+                                 (ggml_prec)dst->op_params[0] == GGML_PREC_DEFAULT;
+
     const ggml_type y_kernel_type = ggml_vk_mul_mat_b_type(ctx, src0->type, src1, f16_type,
-                                        (ggml_prec)dst->op_params[0], false, can_quantize_y, prefer_f16_b);
+                                        (ggml_prec)dst->op_params[0], false, can_quantize_y && !qcom_tilekfirst, prefer_f16_b && !qcom_tilekfirst);
 
     const bool quantize_y       = y_kernel_type == GGML_TYPE_Q8_1;
     const bool y_f32_kernel     = y_kernel_type == GGML_TYPE_F32;
@@ -6409,6 +6450,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, ne11, aligned, false);
+
+    if (qcom_tilekfirst && y_f32_kernel && !qx_needs_dequant && !qy_needs_dequant &&
+        ne10 % ctx->device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom->align == 0) {
+#ifdef GGML_VULKAN_SHADER_DEBUG_INFO
+        std::cerr << "ggml_vk_mul_mat_q_f16: op==GGML_OP_MUL_MAT and src1 is tileK-first-tagged, using QCOM shader with pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom\n";
+#endif
+        pipeline = ctx->device->pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom; // Overwrite the mul_mat pipeline with qcom version
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -8231,8 +8280,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+    // QUALCOMM: dst->extra is tagged by ggml_vk_tag_qcom_tilekfirst() when this flash_attn's
+    // sole consumer is a QCOM tileK-first-eligible mat_mul.
+    bool tilekfirst = (uintptr_t)dst->extra != 0;
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff, tilekfirst);
 
     vk_pipeline pipeline = nullptr;
 
@@ -8881,6 +8933,19 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
             }
+
+            // QUALCOMM: layers with output to mat_mm (QUALCOMM CoopMat) should have different layout.
+            // dst is tagged by ggml_vk_tag_qcom_tilekfirst() when its sole consumer is a QCOM
+            // tileK-first-eligible mat_mul. Different layout will avoid cache issues and increase
+            // the QCOM MxM performance
+            bool qcom_tilekfirst = (uintptr_t)dst->extra != 0;
+            if (qcom_tilekfirst && (dst->ne[1] > 1) && (ctx->fused_rms_norm_mode == RMS_NORM_MUL)) {
+#ifdef GGML_VULKAN_SHADER_DEBUG_INFO
+                std::cerr << "ggml_vk_op_get_pipeline: op==GGML_OP_RMS_NORM and dst is tileK-first-tagged, using QCOM shader with pipeline_rms_norm_mul_f32_qcom\n";
+#endif
+                return ctx->device->pipeline_rms_norm_mul_f32_qcom;
+            }
+
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
         }
         return nullptr;
@@ -8963,7 +9028,20 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             case GGML_GLU_OP_REGLU:
                 return ctx->device->pipeline_reglu[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_SWIGLU:
+            {
+                // QUALCOMM: layers with output to mat_mm (QUALCOMM CoopMat) should have different layout.
+                // dst is tagged by ggml_vk_tag_qcom_tilekfirst() when its sole consumer is a QCOM
+                // tileK-first-eligible mat_mul. Different layout will avoid cache issues and increase
+                // the QCOM MxM performance
+                bool qcom_tilekfirst = (uintptr_t)dst->extra != 0;
+                if (qcom_tilekfirst && (dst->type == GGML_TYPE_F32)) {
+#ifdef GGML_VULKAN_SHADER_DEBUG_INFO
+                    std::cerr << "ggml_vk_op_get_pipeline: op==GGML_GLU_OP_SWIGLU and dst is tileK-first-tagged, using QCOM shader with pipeline_swiglu_f32_qcom\n";
+#endif
+                    return ctx->device->pipeline_swiglu_f32_qcom;
+                }
                 return ctx->device->pipeline_swiglu[dst->type == GGML_TYPE_F16];
+            }
             case GGML_GLU_OP_SWIGLU_OAI:
                 return ctx->device->pipeline_swiglu_oai[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_SWIGLU_CLAMP:
@@ -14739,10 +14817,55 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     UNUSED(backend);
 }
 
+// QUALCOMM: tag tensors whose sole consumer is a QCOM tileK-first-eligible mat_mul, so the
+// shaders that produce them can write their output already in tileK-first layout. Replaces
+// name-string matching with a one-time pass over the actual graph topology.
+static bool ggml_vk_qcom_is_tilekfirst_producer(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL ||
+           node->op == GGML_OP_FLASH_ATTN_EXT ||
+           (node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU);
+}
+
+static bool ggml_vk_qcom_is_tilekfirst_mat_mul(const ggml_tensor * node) {
+    return node->op == GGML_OP_MUL_MAT &&
+           node->src[0]->type == GGML_TYPE_Q4_0 &&
+           node->src[1]->ne[1] > 1;
+}
+
+static void ggml_vk_tag_qcom_tilekfirst(struct ggml_cgraph * graph) {
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> consumer_of;
+    std::unordered_map<const ggml_tensor *, int> consumer_count;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = node->src[s];
+            if (!src) continue;
+            if (consumer_of.find(src) == consumer_of.end()) {
+                consumer_of[src] = node;
+            }
+            consumer_count[src]++;
+        }
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+        if (!ggml_vk_qcom_is_tilekfirst_producer(node)) {
+            continue;
+        }
+        auto it = consumer_count.find(node);
+        if (it != consumer_count.end() && it->second == 1 &&
+            ggml_vk_qcom_is_tilekfirst_mat_mul(consumer_of[node])) {
+            node->extra = (void *)(uintptr_t)1;
+        }
+    }
+}
+
 void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    ggml_vk_tag_qcom_tilekfirst(graph);
 
     if (ctx->device->disable_graph_optimize) {
         return;

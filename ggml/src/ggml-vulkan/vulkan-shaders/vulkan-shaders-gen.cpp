@@ -708,6 +708,11 @@ void process_shaders() {
 #endif
         }
     }
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    // QUALCOMM: Qcom specific MatMul shader
+    string_to_spv("matmul_q4_0_f32_aligned", "matmul_q4_0_f32_aligned_f16acc_cm1_qcom.comp", { {"K_TILE_FIRST","1"}  }, true, true, false, true, "_tilekfirst_qcom");
+    string_to_spv("matmul_q4_0_f32_aligned", "matmul_q4_0_f32_aligned_f16acc_cm1_qcom.comp", { {"PLACEHOLDER","NONE"}}, true, true, false, true, "_qcom");
+#endif
 
     for (const bool& fp16 : {false, true}) {
         std::map<std::string, std::string> base_dict;
@@ -755,6 +760,9 @@ void process_shaders() {
 #endif
         }
     }
+
+    // QUALCOMM: Qcom specific flash_attn shader with TileKFirst output
+    string_to_spv("flash_attn_f32_f16_align_qcom", "flash_attn_f32_f16_align_qcom.comp", { {"PLACEHOLDER","NONE"} }, true, false, false, false);
 
     const std::map<std::string, std::string> fa_bf16_dict = {
         {"FLOAT_TYPE",   "bfloat16_t"},
@@ -854,6 +862,7 @@ void process_shaders() {
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("rms_norm_mul_f32_qcom", "rms_norm_mul_f32_qcom.comp", { {"PLACEHOLDER","NONE"}}); // QUALCOMM spec. same as rms_norm_f32 but with MUL enabled, and change of output layout
     string_to_spv("rms_norm_mul_add_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_mul_add_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_set_rows_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_SET_ROWS_FUSION", "1"}}));
@@ -922,6 +931,9 @@ void process_shaders() {
     }
     }
     }
+
+    // QUALCOMM: Qcom specific mul.comp shader (element-wise f32*f32)
+    string_to_spv("mul_f32_f32_f32_qcom", "mul_f32_f32_f32_qcom.comp", {{"PLACEHOLDER","NONE"}});
 
     string_to_spv("sub_f32", "sub.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
@@ -1056,6 +1068,7 @@ void process_shaders() {
     string_to_spv("reglu_f32",      "reglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_f16",     "swiglu.comp",      {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_f32",     "swiglu.comp",      {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("swiglu_f32_qcom","swiglu_f32_qcom.comp", { {"PLACEHOLDER","NONE"} }); // QUALCOMM spec. same as swiglu_f32 but with change of output layout
     string_to_spv("swiglu_oai_f16", "swiglu_oai.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("swiglu_oai_f32", "swiglu_oai.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("swiglu_clamp_f16", "swiglu_clamp.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});

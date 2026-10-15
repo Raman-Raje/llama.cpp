@@ -424,10 +424,12 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    // QUALCOMM: output must be in tileK-first layout because it feeds a QCOM tileK-first mat_mul
+    bool tilekfirst;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, tilekfirst) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.tilekfirst);
     }
 };
 
@@ -784,6 +786,8 @@ struct vk_device_struct {
     std::map<vk_matmul_pipeline_key, std::vector<vk_matmul_pipeline_pair>> pipeline_matmul;
     matmul_tile_selector_t matmul_tile_selector;
     matmul_tile_selector_t matmul_id_tile_selector;
+    vk_pipeline pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_qcom;            // QUALCOMM specific shader, optimized for Q4_0
+    vk_pipeline pipeline_dequant_mul_mat_mat_Q4_0_f32_f16acc_align_m_tilekfirst_qcom; // QUALCOMM specific shader, optimized for Q4_0 including TileK first layout
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
@@ -811,6 +815,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_sub[2][2][2];
     vk_pipeline pipeline_sub_norepeat[2][2][2];
     vk_pipeline pipeline_mul[2][2][2];
+    vk_pipeline pipeline_mul_f32_f32_f32_qcom; // QUALCOMM specific shader, output to mul_mm with different layout
     vk_pipeline pipeline_mul_norepeat[2][2][2];
     vk_pipeline pipeline_div[2][2][2];
     vk_pipeline pipeline_div_norepeat[2][2][2];
@@ -854,6 +859,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f16;
+    vk_pipeline pipeline_rms_norm_mul_f32_qcom; // QUALCOMM specific: same shader as rms_norm_mul_f32, but includes different (tileK_first) layout
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
@@ -904,6 +910,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_geglu[2];
     vk_pipeline pipeline_reglu[2];
     vk_pipeline pipeline_swiglu[2];
+    vk_pipeline pipeline_swiglu_f32_qcom; // QUALCOMM specific: same shader as swiglu_f32, but includes different (tileK_first) layout
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_swiglu_clamp[2];
     vk_pipeline pipeline_geglu_erf[2];
