@@ -716,6 +716,260 @@ extern "C" {
         char padding[8];
     };
 
+    static const char * ggml_print_op_name(enum ggml_op op) {
+    static const char * names[] = {
+    "NONE",
+    "DUP",
+    "ADD",
+    "ADD_ID",
+    "ADD1",
+    "ACC",
+    "SUB",
+    "MUL",
+    "DIV",
+    "SQR",
+    "SQRT",
+    "LOG",
+    "SIN",
+    "COS",
+    "SUM",
+    "SUM_ROWS",
+    "CUMSUM",
+    "MEAN",
+    "ARGMAX",
+    "COUNT_EQUAL",
+    "REPEAT",
+    "REPEAT_BACK",
+    "CONCAT",
+    "SILU_BACK",
+    "NORM",
+    "RMS_NORM",
+    "RMS_NORM_BACK",
+    "GROUP_NORM",
+    "L2_NORM",
+
+    "MUL_MAT",
+    "MUL_MAT_ID",
+    "OUT_PROD",
+
+    "SCALE",
+    "SET",
+    "CPY",
+    "CONT",
+    "RESHAPE",
+    "VIEW",
+    "PERMUTE",
+    "TRANSPOSE",
+    "GET_ROWS",
+    "GET_ROWS_BACK",
+    "SET_ROWS",
+    "DIAG",
+    "DIAG_MASK_INF",
+    "DIAG_MASK_ZERO",
+    "SOFT_MAX",
+    "SOFT_MAX_BACK",
+    "ROPE",
+    "ROPE_BACK",
+    "CLAMP",
+    "CONV_TRANSPOSE_1D",
+    "IM2COL",
+    "IM2COL_BACK",
+    "IM2COL_3D",
+    "COL2IM_1D",
+    "CONV_2D",
+    "CONV_3D",
+    "CONV_2D_DW",
+    "CONV_TRANSPOSE_2D",
+    "POOL_1D",
+    "POOL_2D",
+    "POOL_2D_BACK",
+    "UPSCALE",
+    "PAD",
+    "PAD_REFLECT_1D",
+    "ROLL",
+    "ARANGE",
+    "TIMESTEP_EMBEDDING",
+    "ARGSORT",
+    "TOP_K",
+    "LEAKY_RELU",
+    "TRI",
+    "FILL",
+
+    "FLASH_ATTN_EXT",
+    "FLASH_ATTN_BACK",
+    "SSM_CONV",
+    "SSM_SCAN",
+    "WIN_PART",
+    "WIN_UNPART",
+    "GET_REL_POS",
+    "ADD_REL_POS",
+    "RWKV_WKV6",
+    "GATED_LINEAR_ATTN",
+    "RWKV_WKV7",
+    "SOLVE_TRI",
+    "GATED_DELTA_NET",
+    "LIGHTNING_INDEXER",
+    "DSV4_HC_COMB",
+    "DSV4_HC_PRE",
+    "DSV4_HC_POST",
+    "UNARY",
+    "MAP_CUSTOM1",
+    "MAP_CUSTOM2",
+    "MAP_CUSTOM3",
+    "CUSTOM",
+    "CROSS_ENTROPY_LOSS",
+    "CROSS_ENTROPY_LOSS_BACK",
+    "OPT_STEP_ADAMW",
+    "OPT_STEP_SGD",
+    "GLU",
+    };
+    return (op >= 0 && op < GGML_OP_COUNT) ? names[op] : "UNKNOWN_OP";
+}
+
+static const char * ggml_type_name_str[GGML_TYPE_COUNT] = {
+    [GGML_TYPE_F32]     = "F32",
+    [GGML_TYPE_F16]     = "F16",
+    [GGML_TYPE_Q4_0]    = "Q4_0",
+    [GGML_TYPE_Q4_1]    = "Q4_1",
+    [GGML_TYPE_Q5_0]    = "Q5_0",
+    [GGML_TYPE_Q5_1]    = "Q5_1",
+    [GGML_TYPE_Q8_0]    = "Q8_0",
+    [GGML_TYPE_Q8_1]    = "Q8_1",
+    [GGML_TYPE_Q2_K]    = "Q2_K",
+    [GGML_TYPE_Q3_K]    = "Q3_K",
+    [GGML_TYPE_Q4_K]    = "Q4_K",
+    [GGML_TYPE_Q5_K]    = "Q5_K",
+    [GGML_TYPE_Q6_K]    = "Q6_K",
+    [GGML_TYPE_Q8_K]    = "Q8_K",
+    [GGML_TYPE_IQ2_XXS] = "IQ2_XXS",
+    [GGML_TYPE_IQ2_XS]  = "IQ2_XS",
+    [GGML_TYPE_IQ3_XXS] = "IQ3_XXS",
+    [GGML_TYPE_IQ1_S]   = "IQ1_S",
+    [GGML_TYPE_IQ4_NL]  = "IQ4_NL",
+    [GGML_TYPE_IQ3_S]   = "IQ3_S",
+    [GGML_TYPE_IQ2_S]   = "IQ2_S",
+    [GGML_TYPE_IQ4_XS]  = "IQ4_XS",
+    [GGML_TYPE_I8]      = "I8",
+    [GGML_TYPE_I16]     = "I16",
+    [GGML_TYPE_I32]     = "I32",
+    [GGML_TYPE_I64]     = "I64",
+    [GGML_TYPE_F64]     = "F64",
+    [GGML_TYPE_IQ1_M]   = "IQ1_M",
+    [GGML_TYPE_BF16]    = "BF16",
+    [GGML_TYPE_TQ1_0]   = "TQ1_0",
+    [GGML_TYPE_TQ2_0]   = "TQ2_0",
+    [GGML_TYPE_MXFP4]   = "MXFP4",
+    [GGML_TYPE_NVFP4]   = "NVFP4",
+    [GGML_TYPE_Q1_0]    = "Q1_0",
+    [GGML_TYPE_Q2_0]    = "Q2_0",
+};
+
+static const char * ggml_type_to_string(enum ggml_type type) {
+    return (type >= 0 && type < GGML_TYPE_COUNT) ? ggml_type_name_str[type] : "UNKNOWN_TYPE";
+}
+
+//    static void ggml_print_tensor_recursive(const struct ggml_tensor * t, int depth) {
+//         if (!t) return;
+
+//         const int indent = depth * 2;
+//         const char * indent_str = "                        ";  // max 24 spaces for indentation
+//         const char * pad = indent_str + (sizeof(indent_str) - 1 - (indent < sizeof(indent_str) ? indent : sizeof(indent_str) - 1));
+
+//         // Count and print sources
+//         int n_sources = 0;
+//         for (int i = 0; i < GGML_MAX_SRC; i++) {
+//                 if (t->src[i]) n_sources++;
+//         }
+
+//         printf("%s--------- [ Tensor - %s ] ---------\n", pad, t->name);
+//         printf("%s  Type: %s\n", pad, ggml_type_to_string(t->type));
+//         printf("%s  Operation: %d (%s)\n", pad, t->op, ggml_print_op_name(t->op));
+//         printf("%s  Flags: 0x%08X\n", pad, t->flags);
+//         printf("%s  Shape: [", pad);
+//         for (int i = 0; i < GGML_MAX_DIMS; i++) {
+//                 printf("%lld", (long long)t->ne[i]);
+//                 if (i < GGML_MAX_DIMS - 1) printf(", ");
+//         }
+//         printf("]\n");
+//         printf("%s  Stride (bytes): [", pad);
+//         for (int i = 0; i < GGML_MAX_DIMS; i++) {
+//                 printf("%zu", t->nb[i]);
+//                 if (i < GGML_MAX_DIMS - 1) printf(", ");
+//         }
+//         printf("]\n");
+
+//         if (n_sources > 0) {
+//                 printf("%s  Sources (%d):\n", pad, n_sources);
+//                 for (int i = 0; i < GGML_MAX_SRC; i++) {
+//                 if (t->src[i]) {
+//                         printf("%s    src[%d] -> '%s'\n", pad, i, t->src[i]->name);
+//                 }
+//                 }
+//         }
+
+//         if (t->view_src) {
+//                 printf("%s  View of tensor '%s' (offset %zu):\n", pad, t->view_src->name, t->view_offs);
+//                 ggml_print_tensor_recursive(t->view_src, depth + 1);
+//         }
+
+//         // Recursively print sources
+//         for (int i = 0; i < GGML_MAX_SRC; i++) {
+//                 if (t->src[i]) {
+//                 ggml_print_tensor_recursive(t->src[i], depth + 1);
+//                 }
+//         }
+
+//         printf("\n");
+//         }
+
+    static void ggml_print_tensor(const struct ggml_tensor * t) {
+        if (!t) return;
+
+        // Count and print sources
+        int n_sources = 0;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (t->src[i]) n_sources++;
+        }
+
+        // if (n_sources > 0) {
+        //         ggml_print_tensor_recursive(t, n_sources);
+        //         return;
+        // }
+        // else {
+
+                printf("--------- [ Tensor - %s ] ---------\n", t->name);
+                printf("  Type: %s\n", ggml_type_to_string(t->type));
+                printf("  Operation: %d\n", t->op);
+                printf("  Operation Name: %s\n", ggml_print_op_name(t->op));
+                printf("  Flags: 0x%08X\n", t->flags);
+                printf("  Sources: %d\n", n_sources);
+                printf("  Shape: [");
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                        printf("%lld", (long long)t->ne[i]);
+                        if (i < GGML_MAX_DIMS - 1) printf(", ");
+                }
+                printf("]\n");
+                printf("  Stride (bytes): [");
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                        printf("%zu", t->nb[i]);
+                        if (i < GGML_MAX_DIMS - 1) printf(", ");
+                }
+                printf("]\n");
+
+                // Print sources
+                for (int i = 0; i < GGML_MAX_SRC; i++) {
+                        if (t->src[i]) {
+                        printf("    src[%d] = '%s'\n", i, t->src[i]->name);
+                        }
+                }
+                if (t->view_src) {
+                        printf("  View of tensor '%s' with offset %zu\n", t->view_src->name, t->view_offs);
+                }
+                printf("\n");
+        // }
+    }        
+
+
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 
     // Abort callback

@@ -3510,6 +3510,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 // Todo: only for adreno with coopmat support
 #if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
     if (device->tilek_support) {
+        VK_LOG_DEBUG("Creating swiglu tilek 32 pipeline ");
         ggml_vk_create_pipeline(device, device->pipeline_swiglu_tilek_f32, "swiglu_tilek_f32", swiglu_tilek_f32_len, swiglu_tilek_f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
     }
 #endif
@@ -4796,8 +4797,14 @@ vk_device ggml_vk_get_device(size_t idx) {
 
             device->tilek_support = device->architecture == QUALCOMM_ADRENO &&
                                     device->coopmat_support &&
-                                    device->coopmat_support_16x16x16_f16acc &&
-                                    device->coopmat_support_16x16x16_f32acc;
+                                    device->coopmat_m == 64 &&
+                                    device->coopmat_n == 64 &&
+                                    device->coopmat_k == 16 &&
+                                    device->subgroup_size == 64 &&
+                                    device->coopmat_acc_f16_support;
+
+            printf("\n=============== [ tilek_support ] ===============\n");
+            printf("TileK support: %s\n", device->tilek_support ? "ENABLED" : "DISABLED");                                    
         }
 
         if (device->coopmat_support) {
@@ -8740,11 +8747,10 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
 // both the pipeline lookup and the dispatch, so the two cannot disagree about
 // what layout the tensor ended up in.
 static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
-//    VK_LOG_DEBUG("ggml_vk_rms_norm_use_tilek( Tilek layout =" << ctx->device->tilek_support << ", TileK candidates =" << ctx->tilek_candidates.count(dst));
-
-   return ctx->device->tilek_support &&
-          !ctx->do_add_rms_partials &&
-          ctx->num_additional_fused_ops == 1 && // rms_norm + mul, no rope
+   printf("\n=============== [ ggml_vk_rms_norm_use_tilek ] =============== \n");
+    ggml_print_tensor(dst);
+   return ctx->device->tilek_support && dst->ne[1] > 1 &&
+          ctx->num_additional_fused_ops > 0 && // rms_norm + mul, no rope
           ctx->tilek_candidates.count(dst) > 0;
 }
 
@@ -8752,6 +8758,8 @@ static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, cons
 // that records the layout, so the two cannot disagree. Only SwiGLU has a TileK
 // shader; the other GLU ops keep the shared row-major path.
 static bool ggml_vk_glu_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+   printf("\n=============== [ ggml_vk_glu_use_tilek ] =============== \n");
+   ggml_print_tensor(dst);
    return ctx->device->tilek_support &&
           dst->type == GGML_TYPE_F32 &&
           ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU &&
@@ -8999,6 +9007,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
            } else if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+               printf("\n Found the candiated ------> \n");
                return ctx->device->pipeline_rms_norm_mul_tilek_f32;
            } else {
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
@@ -9078,9 +9087,6 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return nullptr;
         }
 
-        if (ggml_vk_glu_use_tilek(ctx, dst)) {
-            return ctx->device->pipeline_swiglu_tilek_f32;
-        }
 
         switch (ggml_get_glu_op(dst)) {
             case GGML_GLU_OP_GEGLU:
@@ -9088,6 +9094,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             case GGML_GLU_OP_REGLU:
                 return ctx->device->pipeline_reglu[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_SWIGLU:
+                if (ggml_vk_glu_use_tilek(ctx, dst)) {
+                   printf("\n Found the glu candiate ------> \n");
+                    return ctx->device->pipeline_swiglu_tilek_f32;
+                }
                 return ctx->device->pipeline_swiglu[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_SWIGLU_OAI:
                 return ctx->device->pipeline_swiglu_oai[dst->type == GGML_TYPE_F16];
@@ -14376,33 +14386,60 @@ static int32_t find_first_set(uint32_t x) {
 // the producing op. This checks the one consumer shape we support: a mul_mat
 // reading the tensor as B, dispatched through the mat-mat path, with a TileK
 // matmul available for the weight type.
-static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * use, const ggml_tensor * t) {
-    if (use->op != GGML_OP_MUL_MAT || use->src[1] != t) {
+static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * parent, const ggml_tensor * child) {
+    if (parent->op != GGML_OP_MUL_MAT || parent->src[1] != child) {
+        printf("TileK consumer check failed: parent is not MUL_MAT or child is not src[1]\n");
         return false;
     }
-    const ggml_tensor * a = use->src[0];
-    if (a->type != GGML_TYPE_Q4_0 || ctx->device->pipeline_matmul_tilek_q4_0 == nullptr) {
+    printf("\n=============== [ check 1 passed ] =============== \n");
+
+    const ggml_tensor * a = parent->src[0];
+    if (a->type != GGML_TYPE_Q4_0 ||
+        ctx->device->pipeline_matmul_tilek_q4_0 == nullptr) {
+
+        if (a->type != GGML_TYPE_Q4_0) {
+            printf("TileK consumer check failed: A type is not Q4_0.");
+        }
+
+        if (ctx->device->pipeline_matmul_tilek_q4_0 == nullptr) {
+            printf("TileK consumer check failed: TileK Q4_0 pipeline is unavailable (nullptr)\n");
+        }
+
         return false;
     }
+    printf("\n=============== [ check 2 passed ] =============== \n");
+
     if (!ggml_vk_dim01_contiguous(a)) {
+        printf("TileK consumer check failed: A is not contiguous in dimensions 0/1\n");
         return false;
     }
-    if (!ggml_vk_get_mul_mat_mat_f16acc(ctx, a->type, t->type, (ggml_prec) use->op_params[0])) {
+    printf("\n=============== [ check 3 passed ] =============== \n");
+
+    if (!ggml_vk_get_mul_mat_mat_f16acc(ctx, a->type, child->type, (ggml_prec) parent->op_params[0])) {
+        printf("TileK consumer check failed: mat-mat f16acc pipeline is unavailable\n");
         return false;
     }
+    printf("\n=============== [ check 4 passed ] =============== \n");
+
     // mul_mat_vec would read B row-major. Only take over where
     // ggml_vk_mul_mat() would have picked the mat-mat path anyway.
-    if (use->ne[1] <= mul_mat_vec_max_cols) {
+    if (parent->ne[1] <= 1) {       
         return false;
     }
-    if (a->ne[1] % 64 != 0 || use->ne[1] % 64 != 0) {
-        return false;
-    }
-    // The TileK matmul walks A one quantization block at a time and indexes B
-    // by whole K-tiles, so K has to divide evenly by both.
+    printf("\n=============== [ candiate found ] =============== \n");
+
     if (a->ne[0] % ggml_blck_size(a->type) != 0 || a->ne[0] % GGML_VK_TILEK != 0) {
+        printf(
+            "TileK consumer check failed: K=%lld is not divisible by "
+            "block_size=%lld or TILEK=%lld\n",
+            (long long) a->ne[0],
+            (long long) ggml_blck_size(a->type),
+            (long long) GGML_VK_TILEK);
         return false;
     }
+   printf("\n=============== [ candiate found ] =============== \n");
+    ggml_print_tensor(parent);
+    ggml_print_tensor(child);
     return true;
 }
 
@@ -14471,6 +14508,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // Todo: Run for adreno with coopmat
     ggml_vk_find_tilek_candidates(ctx, cgraph);
+
+    printf("\n=============== [ tilek_candidates ] ===============\n");
+
+    if (ctx->tilek_candidates.empty()) {
+        printf("No TileK candidates found.\n");
+    } else {
+        for (const auto * tensor : ctx->tilek_candidates) {
+            ggml_print_tensor(tensor);
+        }
+    }
+
+    printf("=====================================================\n");
 
     int last_node = cgraph->n_nodes - 1;
 

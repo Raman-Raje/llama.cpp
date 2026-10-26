@@ -358,6 +358,35 @@ struct ggml_cgraph {
     uint64_t uid;
 };
 
+static void ggml_print_graph(const struct ggml_cgraph * graph) {
+    printf("\n=============== [ Computational Graph ] =============== \n");
+    // print graph order 
+    if (graph->order == GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT) {
+        printf("Graph order = left-to-right\n");
+    } else if (graph->order == GGML_CGRAPH_EVAL_ORDER_RIGHT_TO_LEFT) {
+        printf("Graph order = right-to-left\n");
+    } else {
+        printf("Graph order = unknown\n");
+    }
+    printf("Size: %d\n", graph->size);
+    printf("Nodes: %d\n", graph->n_nodes);
+    printf("Leafs: %d\n", graph->n_leafs);
+
+    printf("--- Nodes ---\n");
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        printf("Node #%d:\n", i);
+        ggml_print_tensor(graph->nodes[i]);
+    }
+
+    printf("--- Leafs ---\n");
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        printf("Leaf #%d:\n", i);
+        ggml_print_tensor(graph->leafs[i]);
+    }
+
+    printf("=============== [ End of Graph ] =============== \n");
+}
+
 // returns a slice of cgraph with nodes [i0, i1)
 // the slice does not have leafs or gradients
 // if you need the gradients, get them from the original graph
