@@ -6468,7 +6468,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline pipeline;
     if (tilek_b) {
         VK_LOG_DEBUG("Qcom pipeline selected  pipeline_matmul_tilek_q4_0 --> ") ;
-
+        ggml_print_tensor(dst);
+        ggml_print_tensor(src1);
         pipeline = ctx->device->pipeline_matmul_tilek_q4_0;
         GGML_ASSERT(pipeline != nullptr);
         GGML_ASSERT(ne10 % pipeline->align == 0);
