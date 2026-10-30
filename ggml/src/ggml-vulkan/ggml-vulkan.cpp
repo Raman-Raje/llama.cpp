@@ -3508,12 +3508,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     CREATE_GLU(geglu_quick)
 #undef CREATE_GLU
 
-// Todo: only for adreno with coopmat support
-#if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
     if (device->tilek_support) {
         ggml_vk_create_pipeline(device, device->pipeline_swiglu_tilek_f32, "swiglu_tilek_f32", swiglu_f32_len, swiglu_f32_data, "main", 3, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {1}, 1, true);
     }
-#endif
 
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
