@@ -1376,7 +1376,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 }
 
 vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool use_sparse, ggml_type k_type, ggml_type v_type, bool dst_tilek) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -1388,7 +1388,7 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, dst_tilek};
 }
 
 static uint32_t fa_block_bytes(ggml_type t) {
@@ -1416,6 +1416,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 DstTileK        */ state.dst_tilek ? 1u : 0u,
     };
 }
 
@@ -4796,8 +4797,12 @@ vk_device ggml_vk_get_device(size_t idx) {
 
             device->tilek_support = device->architecture == QUALCOMM_ADRENO &&
                                     device->coopmat_support &&
-                                    device->coopmat_support_16x16x16_f16acc &&
-                                    device->coopmat_support_16x16x16_f32acc;
+                                    device->coopmat_m == 64 &&
+                                    device->coopmat_n == 64 &&
+                                    device->coopmat_k == 16 &&
+                                    device->subgroup_size == 64 &&
+                                    device->coopmat_acc_f16_support;
+                                 
         }
 
         if (device->coopmat_support) {
@@ -6062,6 +6067,67 @@ static bool ggml_vk_get_mul_mat_mat_f16acc(const ggml_backend_vk_context * ctx, 
     return ctx->device->fp16 && prec == GGML_PREC_DEFAULT;
 }
 
+static const ggml_tensor * ggml_vk_fa_tilek_src(const ggml_tensor * tensor) {
+    if (tensor->op != GGML_OP_RESHAPE || tensor->src[0] == nullptr) {
+        return nullptr;
+    }
+
+    const ggml_tensor * src = tensor->src[0];
+    if (src->op != GGML_OP_FLASH_ATTN_EXT || src->type != GGML_TYPE_F32 || tensor->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(tensor)) {
+        return nullptr;
+    }
+    if (src->ne[3] != 1 || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return nullptr;
+    }
+    if (tensor->ne[0] != src->ne[0] * src->ne[1] || tensor->ne[1] != src->ne[2]) {
+        return nullptr;
+    }
+    return src;
+}
+
+static bool ggml_vk_tilek_debug_enabled() {
+    static const bool enabled = getenv("GGML_VK_TILEK_DEBUG") != nullptr;
+    return enabled;
+}
+
+static bool ggml_vk_is_tilek_candidate(const ggml_backend_vk_context * ctx, const ggml_tensor * tensor) {
+    if (ctx->tilek_candidates.count(tensor) > 0) {
+        return true;
+    }
+
+    const ggml_tensor * src = ggml_vk_fa_tilek_src(tensor);
+    return src != nullptr && ctx->tilek_candidates.count(src) > 0;
+}
+
+static void ggml_vk_tilek_debug_selection(const ggml_backend_vk_context * ctx, const char * producer, const ggml_tensor * tensor, bool selected) {
+    if (!ggml_vk_tilek_debug_enabled()) {
+        return;
+    }
+
+    printf("[tilek][%s] candidate=%d selected=%d tensor='%s' op=%d shape=[%lld, %lld, %lld, %lld]\n",
+           producer,
+           (int) ggml_vk_is_tilek_candidate(ctx, tensor),
+           (int) selected,
+           tensor->name,
+           (int) tensor->op,
+           (long long) tensor->ne[0],
+           (long long) tensor->ne[1],
+           (long long) tensor->ne[2],
+           (long long) tensor->ne[3]);
+}
+
+static bool ggml_vk_is_tilek_tensor(const ggml_backend_vk_context * ctx, const ggml_tensor * tensor) {
+    if (ctx->tilek_tensors.count(tensor) > 0) {
+        return true;
+    }
+
+    const ggml_tensor * src = ggml_vk_fa_tilek_src(tensor);
+    return src != nullptr && ctx->tilek_tensors.count(src) > 0;
+}
+
 static const std::vector<vk_matmul_pipeline_pair>* ggml_vk_get_mul_mat_mat_pipeline_map(
         ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, bool mul_mat_id = false) {
     bool f16acc = ggml_vk_get_mul_mat_mat_f16acc(ctx, src0_type, src1_type, prec);
@@ -6425,7 +6491,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // If src0 is BF16, try to use a BF16 x BF16 multiply
     ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
-    const bool tilek_b = ctx->tilek_tensors.count(src1) > 0;
+    const bool tilek_b = ggml_vk_is_tilek_tensor(ctx, src1);
+    if (ggml_vk_is_tilek_candidate(ctx, src1)) {
+        ggml_vk_tilek_debug_selection(ctx, "mul_mat", src1, tilek_b);
+    }
 
     const bool is_coopmat = ctx->device->coopmat_support || ctx->device->coopmat2;
     const bool can_quantize_y = !tilek_b &&
@@ -8122,6 +8191,17 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+static bool ggml_vk_fa_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst, uint32_t gqa_ratio) {
+    return ctx->device->tilek_support &&
+           dst->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(dst) &&
+           gqa_ratio == 1 &&
+           dst->ne[2] > 1 && dst->ne[3] == 1 &&
+           (dst->ne[0] * dst->ne[1]) % ggml_blck_size(GGML_TYPE_Q4_0) == 0 &&
+           (dst->ne[0] * dst->ne[1]) % GGML_VK_TILEK == 0 &&
+           ctx->tilek_candidates.count(dst) > 0;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8298,8 +8378,15 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
     bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+
+    const bool dst_tilek = tuning_params.path == FA_SCALAR && ggml_vk_fa_use_tilek(ctx, dst, gqa_ratio);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff, dst_tilek);
+
+    ggml_vk_tilek_debug_selection(ctx, "flash_attn", dst, dst_tilek);
+    if (ggml_vk_tilek_debug_enabled() && dst_tilek) {
+        ggml_print_tensor(dst);
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -8405,6 +8492,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 }
             }
         }
+    }
+
+    if (dst_tilek) {
+        split_kv = KV;
+        split_k = 1;
     }
 
     if (xe_fa_opt == true) {
@@ -8597,6 +8689,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
 
+    if (dst_tilek) {
+        ctx->tilek_tensors.insert(dst);
+    }
+
     if (xe_fa_opt && split_k > 1) {
         auto upper_power_of_2 = [&](uint32_t in) {
             GGML_ASSERT(in != 0);
@@ -8742,9 +8838,8 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
 static bool ggml_vk_rms_norm_use_tilek(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
 //    VK_LOG_DEBUG("ggml_vk_rms_norm_use_tilek( Tilek layout =" << ctx->device->tilek_support << ", TileK candidates =" << ctx->tilek_candidates.count(dst));
 
-   return ctx->device->tilek_support &&
-          !ctx->do_add_rms_partials &&
-          ctx->num_additional_fused_ops == 1 && // rms_norm + mul, no rope
+   return ctx->device->tilek_support && dst->ne[1] > 1 &&
+          ctx->num_additional_fused_ops > 0 && // rms_norm + mul, no rope
           ctx->tilek_candidates.count(dst) > 0;
 }
 
@@ -9078,9 +9173,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return nullptr;
         }
 
-        if (ggml_vk_glu_use_tilek(ctx, dst)) {
-            return ctx->device->pipeline_swiglu_tilek_f32;
-        }
+
 
         switch (ggml_get_glu_op(dst)) {
             case GGML_GLU_OP_GEGLU:
@@ -9088,6 +9181,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             case GGML_GLU_OP_REGLU:
                 return ctx->device->pipeline_reglu[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_SWIGLU:
+                if (ggml_vk_glu_use_tilek(ctx, dst)) {
+                    return ctx->device->pipeline_swiglu_tilek_f32;
+                }
                 return ctx->device->pipeline_swiglu[dst->type == GGML_TYPE_F16];
             case GGML_GLU_OP_SWIGLU_OAI:
                 return ctx->device->pipeline_swiglu_oai[dst->type == GGML_TYPE_F16];
@@ -11098,7 +11194,9 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     } else {
         // Record the layout before dispatching, so the consuming matmuls later
         // in this graph pick the matching B loader.
-        if (ggml_vk_rms_norm_use_tilek(ctx, dst)) {
+        const bool use_tilek = ggml_vk_rms_norm_use_tilek(ctx, dst);
+        ggml_vk_tilek_debug_selection(ctx, "rms_norm", dst, use_tilek);
+        if (use_tilek) {
             ctx->tilek_tensors.insert(dst);
         }
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
@@ -11152,7 +11250,11 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
 
     // Record the layout before dispatching, so the consuming matmuls later in
     // this graph pick the matching B loader.
-    if (ggml_vk_glu_use_tilek(ctx, dst)) {
+    const bool use_tilek = ggml_vk_glu_use_tilek(ctx, dst);
+    if (ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU) {
+        ggml_vk_tilek_debug_selection(ctx, "swiglu", dst, use_tilek);
+    }
+    if (use_tilek) {
         ctx->tilek_tensors.insert(dst);
     }
 
@@ -14371,35 +14473,34 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-// A tensor may only be written in the TileK-first layout if every consumer
-// reads it in that layout, so the decision belongs to the tensor rather than to
-// the producing op. This checks the one consumer shape we support: a mul_mat
-// reading the tensor as B, dispatched through the mat-mat path, with a TileK
-// matmul available for the weight type.
-static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * use, const ggml_tensor * t) {
-    if (use->op != GGML_OP_MUL_MAT || use->src[1] != t) {
+static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const ggml_tensor * parent, const ggml_tensor * child) {
+    if (parent->op != GGML_OP_MUL_MAT || parent->src[1] != child) {
         return false;
     }
-    const ggml_tensor * a = use->src[0];
+
+    const ggml_tensor * a = parent->src[0];
     if (a->type != GGML_TYPE_Q4_0 || ctx->device->pipeline_matmul_tilek_q4_0 == nullptr) {
         return false;
     }
+
     if (!ggml_vk_dim01_contiguous(a)) {
         return false;
     }
-    if (!ggml_vk_get_mul_mat_mat_f16acc(ctx, a->type, t->type, (ggml_prec) use->op_params[0])) {
+
+    if (a->ne[0] != child->ne[0]) {
         return false;
     }
-    // mul_mat_vec would read B row-major. Only take over where
-    // ggml_vk_mul_mat() would have picked the mat-mat path anyway.
-    if (use->ne[1] <= mul_mat_vec_max_cols) {
+
+    if (!ggml_vk_get_mul_mat_mat_f16acc(ctx, a->type, child->type, (ggml_prec) parent->op_params[0])) {
         return false;
     }
-    if (a->ne[1] % 64 != 0 || use->ne[1] % 64 != 0) {
+
+    // if (parent->ne[1] <= 1) {
+    //     return false;
+    // }
+    if (parent->ne[1] <= mul_mat_vec_max_cols) {
         return false;
-    }
-    // The TileK matmul walks A one quantization block at a time and indexes B
-    // by whole K-tiles, so K has to divide evenly by both.
+    }    
     if (a->ne[0] % ggml_blck_size(a->type) != 0 || a->ne[0] % GGML_VK_TILEK != 0) {
         return false;
     }
@@ -14408,7 +14509,7 @@ static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const
 
 // Collect the tensors whose consumers all read TileK-first. Producers consult
 // this, and record what they actually emitted in ctx->tilek_tensors.
- static void ggml_vk_find_tilek_candidates(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+static void ggml_vk_find_tilek_candidates(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
     ctx->tilek_candidates.clear();
     ctx->tilek_tensors.clear();
 
@@ -14416,41 +14517,56 @@ static bool ggml_vk_tilek_consumer_ok(const ggml_backend_vk_context * ctx, const
         return;
     }
 
-      std::unordered_map<const ggml_tensor *, bool> ok;      // candidate -> all consumers OK so far
-      std::unordered_set<const ggml_tensor *> used;          // candidate -> has >=1 consumer
+    std::unordered_map<const ggml_tensor *, bool> ok;
+    std::unordered_set<const ggml_tensor *> used;
+    std::unordered_map<const ggml_tensor *, uint32_t> consumer_count;
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> sole_consumer;
 
-      for (int i = 0; i < cgraph->n_nodes; i++) {
-          const ggml_tensor * node = cgraph->nodes[i];
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
 
-          // Resolve this node's srcs against anything registered as a candidate so far.
-          for (int s = 0; s < GGML_MAX_SRC; s++) {
-              const ggml_tensor * src = node->src[s];
-              auto it = ok.find(src);
-              if (it != ok.end()) {
-                  it->second = it->second && ggml_vk_tilek_consumer_ok(ctx, node, src);
-                  used.insert(src);
-              }
-          }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            const ggml_tensor * src = node->src[s];
+            if (src == nullptr) {
+                continue;
+            }
 
-          // Register this node as a candidate for everything still downstream.
-          if (node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
-              node->ne[0] % GGML_VK_TILEK == 0 && node->ne[1] > 1 && node->ne[1] % 64 == 0 &&
-              node->ne[2] == 1 && node->ne[3] == 1 &&
-              !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-              ok[node] = true;
-          }
-      }
+            consumer_count[src]++;
+            sole_consumer[src] = node;
 
-      for (auto & [t, all_ok] : ok) {
-          if (all_ok && used.count(t)) {
-              ctx->tilek_candidates.insert(t);
-          }
-      }
-  }
+            auto it = ok.find(src);
+            if (it != ok.end()) {
+                it->second = it->second && ggml_vk_tilek_consumer_ok(ctx, node, src);
+                used.insert(src);
+            }
+        }
+
+        if (node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+            node->ne[0] % ggml_blck_size(GGML_TYPE_Q4_0) == 0 && node->ne[1] > 1 &&
+            node->ne[2] == 1 && node->ne[3] == 1 &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            ok[node] = true;
+        }
+    }
+
+    for (const auto & candidate : ok) {
+        const ggml_tensor * tensor = candidate.first;
+        if (!candidate.second || used.count(tensor) == 0) {
+            continue;
+        }
+
+        ctx->tilek_candidates.insert(tensor);
+        const ggml_tensor * src = ggml_vk_fa_tilek_src(tensor);
+        if (src != nullptr && consumer_count[src] == 1 && sole_consumer[src] == tensor) {
+            ctx->tilek_candidates.insert(src);
+        }
+    }
+}
 
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+    // ggml_print_graph(cgraph);
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     ctx->device->diag_cgraph = nullptr;
