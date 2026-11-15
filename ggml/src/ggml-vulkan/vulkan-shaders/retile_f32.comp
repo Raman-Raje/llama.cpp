@@ -1,0 +1,21 @@
+#version 450
+
+#include "tilek_layout.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer Src { uint data_src[]; };
+layout(binding = 1) writeonly buffer Dst { uint data_dst[]; };
+
+layout(push_constant) uniform parameter {
+    uint K;
+    uint N;
+} p;
+
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+    if (k < p.K) {
+        data_dst[tilek_first_idx(row, k, p.N)] = data_src[row * p.K + k];
+    }
+}

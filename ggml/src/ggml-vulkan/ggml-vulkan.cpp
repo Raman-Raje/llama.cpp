@@ -2584,6 +2584,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->coopmat_support) {
         spec_fn_t cm1_spec = [&](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec(wt, a); };
 
+#if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
+        if (device->tilek_support) {
+            ggml_vk_create_pipeline(device, device->pipeline_retile_f32, "retile_f32", retile_f32_len, retile_f32_data,
+                "main", 2, 2 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_matmul_tilek_q4_0, "matmul_q4_0_f32_tilek_f16acc",
+                matmul_q4_0_f32_tilek_f16acc_cm1_len, matmul_q4_0_f32_tilek_f16acc_cm1_data,
+                "main", 3, sizeof(vk_mat_mat_push_constants), {64, 64, 1}, {}, 32, false, false, 64);
+        }
+#endif
+
         // Intel coopmat1 pins each pipeline's required subgroup size to its warptile WARP element.
         const bool cm1_pin = device->vendor_id == VK_VENDOR_ID_INTEL;
 
@@ -5036,6 +5046,31 @@ vk_device ggml_vk_get_device(size_t idx) {
             device_extensions.push_back("VK_KHR_cooperative_matrix");
         }
 #endif
+#if defined(VK_QCOM_cooperative_matrix_conversion) && defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
+        VkPhysicalDeviceCooperativeMatrixConversionFeaturesQCOM tilek_features {};
+        tilek_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_CONVERSION_FEATURES_QCOM;
+        if (getenv("GGML_VK_TILEK_REFORMAT") && device->architecture == QUALCOMM_ADRENO &&
+            device->coopmat_support && device->coopmat_acc_f16_support &&
+            device->fp16 && device->vulkan_memory_model && vk12_features.shaderInt8 &&
+            device->coopmat_m == 64 && device->coopmat_n == 64 && device->coopmat_k == 16 &&
+            device->subgroup_size == 64 &&
+            std::any_of(ext_props.begin(), ext_props.end(), [](const auto & prop) {
+                return strcmp(prop.extensionName, VK_QCOM_COOPERATIVE_MATRIX_CONVERSION_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 tilek_query {};
+            tilek_query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            tilek_query.pNext = &tilek_features;
+            vkGetPhysicalDeviceFeatures2(device->physical_device, &tilek_query);
+            if (tilek_features.cooperativeMatrixConversion) {
+                device->tilek_support = true;
+                device_extensions.push_back(VK_QCOM_COOPERATIVE_MATRIX_CONVERSION_EXTENSION_NAME);
+                last_struct->pNext = (VkBaseOutStructure *)&tilek_features;
+            }
+        }
+#endif
+        if (getenv("GGML_VK_TILEK_REFORMAT")) {
+            GGML_LOG_INFO("ggml_vulkan: %s: TileK reformat %s\n", device->properties.deviceName.data(), device->tilek_support ? "enabled" : "unavailable");
+        }
         device->name = GGML_VK_NAME + std::to_string(idx);
 
         device_create_info
@@ -6700,6 +6735,55 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
         src0_uma = d_Qx != nullptr;
         src1_uma = d_Qy != nullptr;
+    }
+
+    auto & tilek = ctx->device->pipeline_matmul_tilek_q4_0;
+    const auto & limits = ctx->device->properties.limits;
+    if (tilek && src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        ne00 > 0 && ne00 == ne10 && ne00 % tilek->align == 0 && ne01 > 0 && ne11 > mul_mat_vec_max_cols &&
+        ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) &&
+        ggml_vk_prec_allows_f16acc(ggml_prec_get_src(dst, 1)) &&
+        ggml_nelements(src0) <= UINT32_MAX &&
+        ggml_nbytes(src0) <= limits.maxStorageBufferRange &&
+        ggml_nbytes(dst) <= limits.maxStorageBufferRange &&
+        ggml_nbytes(src1) <= std::min<uint64_t>(limits.maxStorageBufferRange, ctx->device->max_buffer_size) &&
+        CEIL_DIV(ne01, tilek->wg_denoms[0]) <= limits.maxComputeWorkGroupCount[0] &&
+        CEIL_DIV(ne10, ctx->device->pipeline_retile_f32->wg_denoms[0]) <= limits.maxComputeWorkGroupCount[0] &&
+        ne11 <= limits.maxComputeWorkGroupCount[1]) {
+        const uint64_t x_offset = src0_uma ? qx_buf_offset : vk_tensor_offset(src0) + src0->view_offs;
+        const uint64_t y_offset = src1_uma ? qy_buf_offset : vk_tensor_offset(src1) + src1->view_offs;
+        const uint64_t d_offset = vk_tensor_offset(dst) + dst->view_offs;
+        if ((x_offset | y_offset | d_offset) % limits.minStorageBufferOffsetAlignment == 0) {
+            auto & retile = ctx->device->pipeline_retile_f32;
+            const uint32_t m = ne01, n = ne11, k = ne10;
+            const size_t y_size = ggml_nbytes(src1);
+            if (ctx->prealloc_size_y < y_size) {
+                ctx->prealloc_size_y = y_size;
+                ggml_vk_preallocate_buffers(ctx, subctx);
+            }
+            if (ctx->prealloc_y_need_sync) {
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+
+            vk_subbuffer a {src0_uma ? d_Qx : src0_buf_ctx->dev_buffer, x_offset, ggml_nbytes(src0)};
+            const vk_subbuffer b_in {src1_uma ? d_Qy : src1_buf_ctx->dev_buffer, y_offset, y_size};
+            vk_subbuffer b_tilek {ctx->prealloc_y, 0, y_size};
+            vk_subbuffer d {dst_buf_ctx->dev_buffer, d_offset, ggml_nbytes(dst)};
+            const std::array<uint32_t, 2> pc {k, n};
+            ggml_pipeline_request_descriptor_sets(ctx, retile, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, retile, {b_in, b_tilek}, pc, {k, n, 1});
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_matmul(ctx, subctx, tilek, std::move(a), std::move(b_tilek), std::move(d), {},
+                           m, n, k, k, k, m, m * k, n * k, m * n,
+                           1, 1, 1, 1, 1, 1, n, src1->nb[1], dst->nb[1]);
+
+            ctx->prealloc_y_last_pipeline_used = nullptr;
+            ctx->prealloc_y_last_tensor_used = nullptr;
+            ctx->prealloc_y_need_sync = true;
+            return;
+        }
     }
 
     const bool x_non_contig = (ctx->device->coopmat2 && src0->type == GGML_TYPE_F32) ||

@@ -84,6 +84,14 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
     )
 
+    if (GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        test_shader_extension_support(
+            "GL_QCOM_cooperative_matrix_conversion"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat_tilek_conversion.comp"
+            "GGML_VULKAN_TILEK_GLSLC_SUPPORT"
+        )
+    endif()
+
     test_shader_extension_support(
         "GL_NV_cooperative_matrix2"
         "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"

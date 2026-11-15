@@ -758,6 +758,7 @@ struct vk_device_struct {
     bool coopmat_support;
     bool coopmat_acc_f32_support {};
     bool coopmat_acc_f16_support {};
+    bool tilek_support {};
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
@@ -817,6 +818,8 @@ struct vk_device_struct {
     matmul_tile_selector_t matmul_id_tile_selector;
 
     vk_pipeline pipeline_matmul_split_k_reduce;
+    vk_pipeline pipeline_matmul_tilek_q4_0;
+    vk_pipeline pipeline_retile_f32;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];

@@ -680,6 +680,10 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 }
 
 void process_shaders() {
+#if defined(GGML_VULKAN_TILEK_GLSLC_SUPPORT)
+    string_to_spv("retile_f32", "retile_f32.comp", {});
+    string_to_spv("matmul_q4_0_f32_tilek", "mul_mm_tilek.comp", {}, true, true, false, true);
+#endif
     // matmul
     for (const MatMulIdType& matmul_id_type : {MatMulIdType::NONE, MatMulIdType::DEFAULT, MatMulIdType::SUBGROUP}) {
         // No coopmats
