@@ -904,10 +904,11 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+
+            tmp[j][i] = i == 0 ? warp_reduce_sum<warp_size, true>(tmp[j][i]) : warp_reduce_sum<warp_size>(tmp[j][i]);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                    tmp_gate[j][i] = i == 0 ? warp_reduce_sum<warp_size, true>(tmp_gate[j][i]) : warp_reduce_sum<warp_size>(tmp_gate[j][i]);
                 }
             }
 
@@ -1053,10 +1054,10 @@ static __global__ void mul_mat_vec_q_moe(
     // Warp-level reduction only - no shared memory needed
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        tmp[i] = i == 0 ? warp_reduce_sum<warp_size, true>(tmp[i]) : warp_reduce_sum<warp_size>(tmp[i]);
         if constexpr (has_fusion) {
             if (use_gate) {
-                tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+                tmp_gate[i] = i == 0 ? warp_reduce_sum<warp_size, true>(tmp_gate[i]) : warp_reduce_sum<warp_size>(tmp_gate[i]);
             }
         }
     }
@@ -1538,7 +1539,7 @@ static void mul_mat_vec_q_switch_type(
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
-    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
@@ -1557,7 +1558,6 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
-    const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
@@ -1637,7 +1637,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1->data, src1->type, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

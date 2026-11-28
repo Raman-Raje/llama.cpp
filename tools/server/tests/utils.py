@@ -141,6 +141,7 @@ class ServerProcess:
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
     llama_cache: str | None = None
+    share_console: bool = False  # Windows: console control events only reach a server on the console of the tests
 
     # session variables
     process: subprocess.Popen | None = None
@@ -340,9 +341,10 @@ class ServerProcess:
 
         flags = 0
         if "nt" == os.name:
-            flags |= subprocess.DETACHED_PROCESS
             flags |= subprocess.CREATE_NEW_PROCESS_GROUP
-            flags |= subprocess.CREATE_NO_WINDOW
+            if not self.share_console:
+                flags |= subprocess.DETACHED_PROCESS
+                flags |= subprocess.CREATE_NO_WINDOW
 
         if self.log_path:
             self._log = open(self.log_path, "w")
@@ -791,6 +793,23 @@ class ServerPreset:
         server.n_ctx = 1024
         server.n_batch = 512
         server.n_slots = 1
+        server.seed = 42
+        return server
+
+    @staticmethod
+    def small_test() -> ServerProcess:
+        # ~95M Qwen3.5 based VLM with MTP head: chat, tool calling, OCR and draft-mtp in one fixture
+        server = ServerProcess()
+        server.offline = True # will be downloaded by load_all()
+        # mmproj is already provided by HF registry API
+        server.model_hf_file = None
+        server.model_hf_repo = "ggml-org-dev/small-test:F16"
+        server.model_alias = "small-test"
+        server.jinja = True
+        server.n_ctx = 8192
+        server.n_batch = 2048
+        server.n_slots = 2
+        server.n_predict = 512
         server.seed = 42
         return server
 
